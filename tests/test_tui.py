@@ -1,0 +1,2311 @@
+"""Offline tests for the interactive TUI (piped mode, scripted provider).
+
+The TUI's InputReader falls back to plain stdin when not a TTY, so the whole
+REPL is drivable by monkeypatched stdin — no pty needed. The provider is
+scripted (no network); session persistence goes to a tmp store via
+DEEPCODE_SESSIONS_DIR.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import io
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Any, ClassVar
+
+import pytest
+
+pytestmark = pytest.mark.usefixtures("shared_cli_service")
+from rich.cells import cell_len
+from rich.console import Console
+from rich.text import Text
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import cli.tui.app as tui_app
+from cli.execution_options import parse_context_window
+from cli.transcript import TranscriptMode
+from cli.tui import animation, theme
+from cli.tui import text as text_fitting
+from cli.tui.input import InputInterrupted, InputReader, expand_file_refs
+from cli.tui.renderer import EventRenderer
+from cli.tui.text import short_path
+from core import agent_setup
+from core.events import (
+    AgentMessage,
+    AgentMessageCompleted,
+    AgentMessageDelta,
+    AgentReasoningCompleted,
+    AgentReasoningDelta,
+    AgentReasoningStarted,
+    Event,
+    ModelUsageRecorded,
+    PlanStep,
+    PlanStepStatus,
+    PlanUpdated,
+    TaskComplete,
+    ToolActivity,
+    ToolActivityKind,
+    ToolCompleted,
+    ToolStarted,
+    TurnStarted,
+)
+from core.providers.base import LLMResponse, ToolCallRequest
+from core.reasoning import ReasoningAvailability, ReasoningChannel
+
+
+class _ScriptedProvider:
+    def __init__(
+        self,
+        replies: list[Any],
+        *,
+        first_call_delay: float = 0,
+    ):
+        self.replies = list(replies)
+        self.calls = 0
+        self.first_call_delay = first_call_delay
+
+    def get_default_model(self):
+        return "fake-model"
+
+    async def chat_with_retry(self, **kwargs: Any):
+        i = min(self.calls, len(self.replies) - 1)
+        self.calls += 1
+        if i == 0 and self.first_call_delay:
+            await asyncio.sleep(self.first_call_delay)
+        reply = self.replies[i]
+        if isinstance(reply, LLMResponse):
+            return reply
+        return LLMResponse(content=reply, finish_reason="stop")
+
+
+class _Profile:
+    model = "fake-model"
+
+
+def test_context_window_parser_accepts_human_units_and_auto() -> None:
+    assert parse_context_window("32k") == 32_000
+    assert parse_context_window("1.5M") == 1_500_000
+    assert parse_context_window("auto") is None
+    with pytest.raises(ValueError, match="between"):
+        parse_context_window("2k")
+
+
+def _patch_provider(monkeypatch, provider):
+    monkeypatch.setattr(
+        agent_setup, "get_workflow_provider", lambda **kw: (provider, _Profile())
+    )
+    monkeypatch.setattr(
+        agent_setup,
+        "get_runtime",
+        lambda: type("R", (), {"config": type("C", (), {"security": None})()})(),
+    )
+
+
+def _run_tui(
+    monkeypatch,
+    tmp_path,
+    stdin_text: str,
+    replies: list[Any],
+    workspace: str = "ws",
+    first_call_delay: float = 0,
+) -> tuple[int, Any]:
+    (tmp_path / workspace).mkdir(parents=True, exist_ok=True)
+    provider = _ScriptedProvider(
+        replies,
+        first_call_delay=first_call_delay,
+    )
+    _patch_provider(monkeypatch, provider)
+    monkeypatch.setenv("DEEPCODE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("DEEPCODE_SESSIONS_DIR", str(tmp_path / "sessions"))
+    # Fresh default store per test (the singleton caches the env root).
+    import core.sessions.store as store_mod
+
+    monkeypatch.setattr(store_mod, "_DEFAULT_STORE", None)
+    monkeypatch.setattr("sys.stdin", io.StringIO(stdin_text))
+    rc = tui_app.main(["--workspace", str(tmp_path / workspace), "--trust"])
+    return rc, provider
+
+
+def test_multi_turn_conversation(monkeypatch, tmp_path, capsys):
+    rc, provider = _run_tui(
+        monkeypatch,
+        tmp_path,
+        "first task\nsecond task\n/exit\n",
+        ["reply one", "reply two"],
+    )
+    assert rc == 0
+    assert provider.calls == 2
+    out = capsys.readouterr().out
+    assert "reply one" in out and "reply two" in out
+
+
+def test_noninteractive_tui_requires_trust_without_creating_a_session(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    from core.sessions import SessionStore
+
+    workspace = tmp_path / "untrusted"
+    workspace.mkdir()
+    monkeypatch.setenv("DEEPCODE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("DEEPCODE_SESSIONS_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setattr("sys.stdin", io.StringIO("/exit\n"))
+
+    assert tui_app.main(["--workspace", str(workspace)]) == 1
+
+    assert SessionStore(tmp_path / "sessions").list_sessions() == []
+    assert "--trust" in capsys.readouterr().err
+
+
+class _Terminal(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def _service_trust_state(workspace: Path) -> str:
+    from app_server.blocking_client import BlockingServiceClient
+    from app_server.service_state import ServiceFiles
+    from core.persistence.database import default_database_path
+
+    rpc = BlockingServiceClient(ServiceFiles(default_database_path()))
+    try:
+        return rpc.call("project/add", {"path": str(workspace)})["project"][
+            "trustState"
+        ]
+    finally:
+        rpc.close()
+
+
+@pytest.mark.parametrize(("answer", "trusted"), [("yes", True), ("no", False)])
+def test_service_tui_asks_before_trusting_a_folder_in_a_terminal(
+    monkeypatch, tmp_path, capsys, answer, trusted
+):
+    """The in-process TUI asked; the shared-service one only said "untrusted"."""
+    from core.sessions import SessionStore
+
+    workspace = tmp_path / "untrusted"
+    workspace.mkdir()
+    monkeypatch.setenv("DEEPCODE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("DEEPCODE_SESSIONS_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setattr("sys.stdin", _Terminal(f"{answer}\n"))
+    monkeypatch.setattr(tui_app, "_silence_console_logging", lambda: None)
+    opened: list[dict] = []
+
+    class _App:
+        def __init__(self, **kwargs):
+            opened.append(kwargs)
+
+        async def repl(self):
+            return 0
+
+    monkeypatch.setattr(tui_app, "TuiApp", _App)
+
+    assert tui_app.main(["--workspace", str(workspace)]) == (0 if trusted else 1)
+
+    err = capsys.readouterr().err
+    assert "Trust this folder?" in err and str(workspace.resolve()) in err
+    assert len(opened) == (1 if trusted else 0)
+    assert _service_trust_state(workspace) == ("trusted" if trusted else "untrusted")
+    assert SessionStore(tmp_path / "sessions").list_sessions() == []
+
+
+def test_slash_help_lists_registry(monkeypatch, tmp_path, capsys):
+    rc, _ = _run_tui(monkeypatch, tmp_path, "/help\n/exit\n", ["unused"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    for name in (
+        "/new",
+        "/resume",
+        "/model",
+        "/effort",
+        "/permissions",
+        "/transcript",
+        "/skills",
+        "/skill",
+        "/plugins",
+        "/mcp",
+        "/goal",
+        "/clear",
+        "/exit",
+    ):
+        assert name in out
+
+
+def test_tui_lists_plugin_and_its_mcp_without_a_model_turn(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    from core.plugins.registry import LocalPluginRegistry
+    from core.plugins.resolver import resolve_plugin
+
+    plugin_root = tmp_path / "plugin"
+    plugin_root.mkdir()
+    (plugin_root / "plugin.json").write_text(
+        json.dumps(
+            {
+                "$schema": (
+                    "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
+                ),
+                "name": "review-tools",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (plugin_root / "mcp.json").write_text(
+        json.dumps(
+            {
+                "$schema": ("https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"),
+                "mcpServers": {
+                    "context": {
+                        "type": "streamable-http",
+                        "url": "http://127.0.0.1:8765/mcp",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    LocalPluginRegistry(tmp_path / "home" / "plugins" / "registry.json").add(
+        resolve_plugin(plugin_root)
+    )
+
+    rc, provider = _run_tui(
+        monkeypatch,
+        tmp_path,
+        "/plugins\n/mcp\n/exit\n",
+        ["unused"],
+    )
+
+    assert rc == 0
+    assert provider.calls == 0
+    output = capsys.readouterr().out
+    assert "review-tools" in output
+    assert "mcp:ready" in output
+    assert "plugin" in output
+    assert "review-tools/context" in output
+
+
+def test_tui_adds_presets_and_really_probes_without_a_model_turn(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    home = tmp_path / "home"
+    fixture = Path(__file__).parent / "fixtures" / "mcp_runtime_server.py"
+    home.mkdir()
+    (home / "deepcode_config.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "fixture": {
+                        "type": "stdio",
+                        "command": sys.executable,
+                        "args": [str(fixture)],
+                        "enabled": False,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rc, provider = _run_tui(
+        monkeypatch,
+        tmp_path,
+        "/mcp presets\n/mcp add context7\n/mcp test fixture\n/mcp\n/exit\n",
+        ["unused"],
+    )
+
+    assert rc == 0
+    assert provider.calls == 0
+    output = capsys.readouterr().out
+    assert "Bundled MCP presets" in output
+    assert "notion" in output
+    assert "added MCP preset context7 in disabled state" in output
+    assert "MCP test passed for fixture: 3 tools, 1 resources, 1 prompts" in output
+    assert "tested" in output
+
+
+def test_unknown_command_hints(monkeypatch, tmp_path, capsys):
+    rc, _ = _run_tui(monkeypatch, tmp_path, "/nope\n/exit\n", ["unused"])
+    assert rc == 0
+    assert "unknown command" in capsys.readouterr().out
+
+
+def test_cli_permissions_are_session_scoped_and_full_access_is_confirmed(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    rc, _ = _run_tui(
+        monkeypatch,
+        tmp_path,
+        (
+            "/permissions\n"
+            "/permissions read-only\n"
+            "/permissions full-access\n"
+            "no\n"
+            "/permissions\n"
+            "/permissions full-access\n"
+            "yes\n"
+            "/permissions\n"
+            "/permissions inherit\n"
+            "/permissions unsafe\n"
+            "/exit\n"
+        ),
+        ["unused"],
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "New Turns: inherit · effective: default (ask)" in out
+    assert "New Turns: read only" in out
+    assert "Full access was not enabled." in out
+    assert "New Turns: full access" in out
+    assert "New submissions use this access" in out
+    assert "usage: /permissions [ask|read-only|full-access|inherit]" in out
+
+
+def test_cli_renderer_marks_a_nonzero_command_as_failed():
+    output = io.StringIO()
+    renderer = EventRenderer(
+        Console(file=output, color_system=None, width=120),
+    )
+
+    renderer.on_event(
+        Event(
+            "1",
+            ToolCompleted(
+                "bash-failed",
+                "bash",
+                True,
+                "[exit 2]\nruff failed",
+            ),
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "bash failed" in rendered
+    assert "[exit 2]" in rendered
+
+
+def _reasoning_events() -> list[Event]:
+    return [
+        Event("1", AgentReasoningStarted("reasoning-1", effort="high")),
+        Event(
+            "2",
+            AgentReasoningDelta(
+                "reasoning-1",
+                ReasoningChannel.SUMMARY,
+                "Checked inputs.\nAdditional summary detail.",
+            ),
+        ),
+        Event(
+            "3",
+            AgentReasoningDelta(
+                "reasoning-1",
+                ReasoningChannel.PROVIDER_TRACE,
+                "Provider trace detail.",
+            ),
+        ),
+        Event(
+            "4",
+            AgentReasoningCompleted(
+                "reasoning-1",
+                summary_text="Checked inputs.\nAdditional summary detail.",
+                trace_text="Provider trace detail.",
+                availability=ReasoningAvailability.AVAILABLE,
+                effort="high",
+                duration_ms=2200,
+            ),
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mode", "included", "excluded"),
+    [
+        (
+            TranscriptMode.NORMAL,
+            ("Thought for 2s", "Checked inputs."),
+            ("Additional summary detail.", "Provider trace detail."),
+        ),
+        (
+            TranscriptMode.VERBOSE,
+            (
+                "Thought for 2s",
+                "Additional summary detail.",
+                "Provider trace detail.",
+            ),
+            (),
+        ),
+        (
+            TranscriptMode.SUMMARY,
+            (),
+            ("Thought for 2s", "Checked inputs.", "Provider trace detail."),
+        ),
+    ],
+)
+def test_cli_reasoning_respects_transcript_mode(mode, included, excluded):
+    output = io.StringIO()
+    renderer = EventRenderer(
+        Console(file=output, color_system=None, width=120),
+        transcript_mode=mode,
+    )
+
+    for event in _reasoning_events():
+        renderer.on_event(event)
+
+    rendered = output.getvalue()
+    for text in included:
+        assert text in rendered
+    for text in excluded:
+        assert text not in rendered
+
+
+def test_verbose_reasoning_is_indented_under_its_card():
+    """The full reasoning reads as the card's body, not as stray prose."""
+    output = io.StringIO()
+    renderer = EventRenderer(
+        Console(file=output, color_system=None, width=40),
+        transcript_mode=TranscriptMode.VERBOSE,
+    )
+    thought = (
+        "先读取 main.js，确认 relic_offer 在哪里触发，再决定埋点的位置。\n\n"
+        "- 检查 death 事件"
+    )
+    renderer.on_event(Event("1", AgentReasoningStarted("r1", effort="high")))
+    renderer.on_event(
+        Event("2", AgentReasoningDelta("r1", ReasoningChannel.SUMMARY, thought))
+    )
+    renderer.on_event(
+        Event(
+            "3",
+            AgentReasoningCompleted(
+                "r1",
+                summary_text=thought,
+                trace_text="",
+                availability=ReasoningAvailability.AVAILABLE,
+                effort="high",
+                duration_ms=2200,
+            ),
+        )
+    )
+
+    lines = [line.rstrip() for line in output.getvalue().splitlines()]
+    card = next(i for i, line in enumerate(lines) if "Thought for 2s" in line)
+    assert lines[card + 1 :] == [
+        "  先读取 main.js，确认 relic_offer 在哪",
+        "  里触发，再决定埋点的位置。",
+        "",
+        "   • 检查 death 事件",
+    ]
+
+
+def test_the_reasoning_preview_wraps_under_its_card_and_keeps_words():
+    output = io.StringIO()
+    renderer = EventRenderer(Console(file=output, color_system=None, width=40))
+    thought = "**先读取** main.js，确认 `relic_offer` 在哪里触发，再决定埋点的位置。"
+    renderer.on_event(Event("1", AgentReasoningStarted("r1", effort="high")))
+    renderer.on_event(
+        Event("2", AgentReasoningDelta("r1", ReasoningChannel.SUMMARY, thought))
+    )
+    renderer.on_event(
+        Event(
+            "3",
+            AgentReasoningCompleted(
+                "r1",
+                summary_text=thought,
+                trace_text="",
+                availability=ReasoningAvailability.AVAILABLE,
+                effort="high",
+                duration_ms=2200,
+            ),
+        )
+    )
+
+    lines = [line.rstrip() for line in output.getvalue().splitlines()]
+    card = next(i for i, line in enumerate(lines) if "Thought for 2s" in line)
+    assert lines[card + 1 :] == [
+        "  先读取 main.js，确认 relic_offer 在哪",
+        "  里触发，再决定埋点的位置。",
+    ]
+
+
+def test_a_summary_line_drops_markdown_marks_but_keeps_identifiers():
+    from cli.tui.renderer import _clean_line
+
+    assert _clean_line("## **Plan**: check `relic_offer` and _why_") == (
+        "Plan: check relic_offer and why"
+    )
+    for text in ("self._cache", "os._exit(1)", "*args / **kwargs", "a * b"):
+        assert _clean_line(text) == text
+    assert _clean_line("open `__init__.py` and `*.py`") == "open __init__.py and *.py"
+    # Chinese has no spaces around bold; marks around a code span go too.
+    assert _clean_line("这是**重点**内容") == "这是重点内容"
+    assert _clean_line("**`relic_offer`** 在哪里触发") == "relic_offer 在哪里触发"
+    # A rule is not a line of thought.
+    assert [_clean_line(rule) for rule in ("***", "- - -", "___")] == ["", "", ""]
+
+
+def test_a_summary_line_is_cleaned_in_linear_time():
+    """The status line cleans the newest reasoning line on every repaint."""
+    from time import perf_counter
+
+    from cli.tui.renderer import _clean_line
+
+    started = perf_counter()
+    for text in (" _x" * 7000, " *x" * 7000, " **x" * 5000, "`" * 4000):
+        _clean_line(text)
+    assert perf_counter() - started < 0.5
+
+
+def test_cli_status_line_tracks_live_reasoning_without_printing_deltas():
+    output = io.StringIO()
+    renderer = EventRenderer(Console(file=output, color_system=None, width=120))
+    events = _reasoning_events()
+
+    renderer.on_event(events[0])
+    renderer.on_event(events[1])
+
+    status = renderer.status_line()
+    assert "Thinking" in status
+    assert "High" in status
+    # A RUNNING block is summarised by its newest line, dsh's live Think row.
+    # Pinning the first line froze this detail on the opening sentence for the
+    # whole turn, which read as a hung UI.
+    assert "Additional summary detail." in status
+    assert "Checked inputs." not in status
+    assert output.getvalue() == ""
+
+
+def test_cli_status_fragments_animate_while_work_runs_and_settle_when_idle():
+    """The status line is the TUI's only animated surface.
+
+    Motion is a pure function of elapsed time (spinner phase + dsh's glare
+    sweep), so a repaint mid-turn must produce fragments that differ from
+    the still, single-fragment idle line — and never print anything.
+    """
+    output = io.StringIO()
+    renderer = EventRenderer(Console(file=output, color_system=None, width=120))
+
+    idle = renderer.status_fragments()
+    assert len(idle) == 1
+    assert "Transcript" in idle[0][1]
+
+    renderer.on_event(Event("1", AgentReasoningStarted("reasoning-1", effort="high")))
+    running = renderer.status_fragments()
+
+    assert running[0][1].strip() in animation.SPINNER_FRAMES
+    assert "".join(text for _style, text in running[1:]).startswith("Thinking")
+    assert output.getvalue() == ""
+
+
+def test_status_reports_the_turn_itself_while_the_provider_is_silent():
+    """The commonest state has no tool and no reasoning to name.
+
+    A turn spends most of its life waiting for the first token. Reporting
+    nothing there left the status line reading "Transcript: normal" for
+    ten seconds at a time, which is indistinguishable from a hung UI.
+    """
+    output = io.StringIO()
+    renderer = EventRenderer(Console(file=output, color_system=None, width=100))
+
+    assert "Transcript" in renderer.status_line()
+
+    renderer.on_event(Event("1", TurnStarted()))
+    assert "Working" in renderer.status_line()
+
+    renderer.on_event(Event("2", AgentMessageDelta("half an ans", "m1")))
+    assert "Responding" in renderer.status_line()
+
+    # A tool outranks both: it is what the user is actually waiting on.
+    renderer.on_event(
+        Event(
+            "3",
+            ToolStarted(
+                "call-1",
+                "bash",
+                activity=ToolActivity(ToolActivityKind.RUN, "Run", "pytest -q"),
+            ),
+        )
+    )
+    assert "Run" in renderer.status_line()
+    renderer.on_event(Event("4", ToolCompleted("call-1", "bash", False, "ok")))
+
+    renderer.on_event(Event("5", TaskComplete("done", "completed")))
+    assert "Transcript" in renderer.status_line()
+
+
+def test_status_settles_when_a_turn_is_interrupted():
+    output = io.StringIO()
+    renderer = EventRenderer(Console(file=output, color_system=None, width=100))
+    renderer.on_event(Event("1", TurnStarted()))
+    renderer.on_event(
+        Event(
+            "2",
+            ToolStarted(
+                "call-1",
+                "bash",
+                activity=ToolActivity(ToolActivityKind.RUN, "Run", "sleep 60"),
+            ),
+        )
+    )
+    assert "Run" in renderer.status_line()
+
+    # Esc cancels the turn task. No terminal EVENT follows a cancellation —
+    # the task that would emit it is the one that was cancelled — so the
+    # interrupt path settles the status itself.
+    renderer.settle_turn()
+    assert "Transcript" in renderer.status_line()
+
+    # And the ordinary path still settles on the kernel's own terminal event.
+    renderer.on_event(Event("4", TurnStarted()))
+    assert "Working" in renderer.status_line()
+    renderer.on_event(Event("5", TaskComplete(None, "completed")))
+    assert "Transcript" in renderer.status_line()
+
+
+def test_status_line_reports_the_newest_tool_and_counts_the_rest():
+    output = io.StringIO()
+    renderer = EventRenderer(
+        Console(file=output, color_system=None, width=120),
+        workspace="/repo",
+    )
+
+    renderer.on_event(
+        Event(
+            "1",
+            ToolStarted(
+                "call-1",
+                "grep",
+                activity=ToolActivity(ToolActivityKind.SEARCH, "Search", "def resolve"),
+            ),
+        )
+    )
+    renderer.on_event(
+        Event(
+            "2",
+            ToolStarted(
+                "call-2",
+                "read",
+                activity=ToolActivity(
+                    ToolActivityKind.READ, "Read", "/repo/core/app.py"
+                ),
+            ),
+        )
+    )
+
+    status = renderer.status_line()
+    assert "Read" in status
+    assert "core/app.py" in status
+    assert "+1 running" in status
+
+
+@pytest.mark.asyncio
+async def test_the_prompt_repaints_only_while_something_is_moving(
+    monkeypatch, tmp_path
+):
+    """An idle TUI must cost nothing.
+
+    prompt_toolkit's own ``refresh_interval`` is a metronome: at animation
+    speed it repaints a line that never changes, all day, for ~10% of a
+    core. The animation loop asks the renderer instead, and settles with
+    one last repaint so the line does not freeze mid-spinner.
+    """
+
+    class InteractiveInput(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    repaints: list[int] = []
+
+    class FakeApp:
+        def invalidate(self) -> None:
+            repaints.append(1)
+
+    class FakePromptSession:
+        def __init__(self, **kwargs: Any) -> None:
+            self.app = FakeApp()
+
+    monkeypatch.setattr("sys.stdin", InteractiveInput())
+    monkeypatch.setattr("cli.tui.input.PromptSession", FakePromptSession)
+    monkeypatch.setattr("cli.tui.input._HISTORY_PATH", tmp_path / "history")
+
+    working = False
+    reader = InputReader(
+        str(tmp_path),
+        status_provider=lambda: [("", "status")],
+        activity_probe=lambda: working,
+    )
+
+    task = asyncio.create_task(reader._animate())
+    try:
+        await asyncio.sleep(0.4)
+        assert repaints == [], "an idle prompt is never repainted"
+
+        working = True
+        await asyncio.sleep(0.45)
+        during = len(repaints)
+        assert during >= 3, f"animation should repaint ~10x/s, saw {during}"
+
+        working = False
+        await asyncio.sleep(0.45)
+        # Exactly one trailing repaint: the line settles, then stays still.
+        assert len(repaints) == during + 1
+    finally:
+        task.cancel()
+
+
+def test_banner_draws_the_logo_and_falls_back_on_a_narrow_terminal(
+    monkeypatch,
+    tmp_path,
+):
+    """The brand is the logo; a terminal too narrow for it still gets one.
+
+    The art's rows print independently (nothing aligns across them), so the
+    only width question is whether the mark fits at all.
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    _patch_provider(monkeypatch, _ScriptedProvider(["unused"]))
+    monkeypatch.setenv("DEEPCODE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("DEEPCODE_SESSIONS_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    import core.sessions.store as store_mod
+
+    monkeypatch.setattr(store_mod, "_DEFAULT_STORE", None)
+
+    app = tui_app.TuiApp(
+        shared_service=False,
+        workspace=str(workspace),
+        model=None,
+        max_iterations=20,
+        trust_workspace=True,
+    )
+    try:
+        wide = io.StringIO()
+        app.console = Console(file=wide, color_system=None, width=100)
+        app._banner()
+        rendered = wide.getvalue()
+        assert theme.BRAND_ART[0][0] in rendered
+        assert "DeepCode" in rendered
+        assert theme.BRAND_TAGLINE in rendered
+
+        narrow = io.StringIO()
+        app.console = Console(file=narrow, color_system=None, width=12)
+        app._banner()
+        squeezed = narrow.getvalue()
+        assert theme.BRAND_ART[0][0] not in squeezed
+        assert theme.BRAND_MARK in squeezed
+        assert "DeepCode" in squeezed
+    finally:
+        app.goal_controller.close()
+        asyncio.run(app.thread_client.close())
+        if app._session_activity is not None:
+            app._session_activity.close()
+
+
+def test_text_fits_to_terminal_cells_not_characters():
+    """A CJK glyph is two columns; ``len`` says one, and the row wraps."""
+    wide = "读取文件内容并总结"  # 9 glyphs, 18 cells
+
+    head = text_fitting.fit_head(wide, 10)
+    assert cell_len(head) <= 10
+    assert head.startswith("读取")
+
+    tail = text_fitting.fit_tail(wide, 10)
+    assert cell_len(tail) <= 10
+    assert tail.endswith("总结")
+
+    # Something already inside the budget comes back untouched.
+    assert text_fitting.fit_head("short", 40) == "short"
+    assert text_fitting.fit_tail("short", 40) == "short"
+
+
+def _wrapped(text: str, width: int) -> list[str]:
+    return [line.plain for line in text_fitting.wrap_text(Text(text), width)]
+
+
+def test_cjk_prose_breaks_between_characters_and_keeps_words_whole():
+    """Rich breaks only at spaces, and CJK text has none between words.
+
+    A CJK run jumped whole to the next line, leaving a short one behind, or
+    was cut at the edge, splitting an English word inside it ("rel|ic_offer").
+    """
+    text = "埋点：run_start、death、relic_offer 这些事件都要记录下来，并且在面板里展示出来以便调试。"
+    assert _wrapped(text, 30) == [
+        "埋点：run_start、death、",  # "relic_offer" would cross the edge
+        "relic_offer 这些事件都要记录下",
+        "来，并且在面板里展示出来以便调",
+        "试。",
+    ]
+    # Text with spaces wraps at them, as before.
+    sentence = "This sentence is long enough that it has to wrap at least once."
+    assert _wrapped(sentence, 40) == [
+        "This sentence is long enough that it has",
+        "to wrap at least once.",
+    ]
+
+
+def test_cjk_punctuation_never_starts_or_ends_a_line_on_the_wrong_side():
+    lines = _wrapped("他说：“你好”。然后离开了这个房间，没有再回来。", 12)
+    assert lines == ["他说：“你", "好”。然后离", "开了这个房", "间，没有再回", "来。"]
+    assert all(cell_len(line) <= 12 for line in lines)
+
+
+def test_straight_quotes_stay_with_the_text_they_enclose():
+    assert _wrapped('然后点击"保存"按钮即可。', 10) == [
+        "然后点",
+        '击"保存"按',
+        "钮即可。",
+    ]
+
+
+def test_leading_spaces_stay_with_the_first_word():
+    """An indented line too long for the width keeps its indent."""
+    url = "https://example.com/a/very/long/path/that/does/not/fit"
+    first, *_ = _wrapped(" " * 12 + url, 40)
+    assert first == " " * 12 + url[:28]
+
+
+def test_a_word_wider_than_the_line_is_cut_at_the_edge():
+    assert _wrapped("averyveryverylongidentifier and more", 10) == [
+        "averyveryv",
+        "erylongide",
+        "ntifier",
+        "and more",
+    ]
+    # Every line keeps at least one character, even one wider than the line,
+    # and a combining accent stays with the character it marks.
+    assert _wrapped("中文", 1) == ["中", "文"]
+    assert _wrapped("中\u0301文", 1) == ["中\u0301", "文"]
+
+
+def test_workspace_paths_shorten_only_when_they_are_paths():
+    assert text_fitting.workspace_path("/repo/core/app.py", "/repo") == "core/app.py"
+    # Outside the workspace it stays absolute (home-folded), and a value that
+    # is not a path — a command, a search pattern — is never touched.
+    assert text_fitting.workspace_path("/etc/hosts", "/repo") == "/etc/hosts"
+    assert text_fitting.workspace_path("ls -la /repo", "/repo") == "ls -la /repo"
+    # A relative argument keeps its shape, minus the "./" tools carry around.
+    assert text_fitting.workspace_path("./core/app.py", "/repo") == "core/app.py"
+    assert text_fitting.workspace_path("core/app.py", "/repo") == "core/app.py"
+
+
+def test_sweep_crosses_the_label_then_holds_off_it_for_the_rest_of_the_cycle():
+    """dsh's keyframes: travel to the far edge by 90%, then a beat.
+
+    Without the hold the band re-enters the moment it leaves and the label
+    strobes; the beat is what makes it read as a sweep.
+    """
+    width = 12
+    starts = [animation.sweep_span(width, t / 20)[0] for t in range(0, 47)]
+    assert starts == sorted(starts), "the band never moves backwards mid-cycle"
+
+    # Inside the hold (the last 10% of the cycle) nothing is lit.
+    hold = animation.SWEEP_SECONDS * animation.SWEEP_HOLD
+    start, end = animation.sweep_span(width, hold + 0.01)
+    assert start == end
+
+    # And the next cycle starts over.
+    assert animation.sweep_span(width, animation.SWEEP_SECONDS + 0.01)[0] == 0
+
+
+def test_shimmer_and_spinner_are_pure_functions_that_lose_nothing():
+    label = "Thinking"
+    for tick in range(0, 60):
+        elapsed = tick / 20
+        fragments = animation.shimmer(label, elapsed, base_style="a", glare_style="b")
+        assert "".join(text for _style, text in fragments) == label
+        assert animation.spinner_frame(elapsed) in animation.SPINNER_FRAMES
+    # Pure: the same instant renders the same frame, always.
+    assert animation.spinner_frame(1.5) == animation.spinner_frame(1.5)
+    assert animation.spinner_frame(0.0) == animation.SPINNER_FRAMES[0]
+
+
+def test_tool_cards_name_paths_the_way_the_user_would_type_them():
+    output = io.StringIO()
+    renderer = EventRenderer(
+        Console(file=output, color_system=None, width=100),
+        workspace="/repo",
+    )
+
+    renderer.on_event(
+        Event(
+            "1",
+            ToolStarted(
+                "call-1",
+                "read",
+                activity=ToolActivity(
+                    ToolActivityKind.READ,
+                    "Read",
+                    "/repo/core/tui/renderer.py",
+                ),
+            ),
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "core/tui/renderer.py" in rendered
+    assert "/repo/core" not in rendered
+
+
+_TEST_RUN = "\n".join(
+    ["===== test session starts ====="]
+    + [f"tests/test_{index}.py ......" for index in range(60)]
+    + ["===== 360 passed in 1.2s ====="]
+)
+
+
+def _settled_elbow(
+    result: str,
+    *,
+    mode: TranscriptMode = TranscriptMode.NORMAL,
+    kind: ToolActivityKind = ToolActivityKind.RUN,
+    width: int = 100,
+) -> list[str]:
+    from core.events.protocol import summarize_result
+
+    output = io.StringIO()
+    renderer = EventRenderer(
+        Console(file=output, color_system=None, width=width),
+        transcript_mode=mode,
+    )
+    activity = ToolActivity(kind, kind.value.title(), "subject")
+    renderer.on_event(Event("1", ToolStarted("call", "tool", activity=activity)))
+    renderer.on_event(
+        Event("2", ToolCompleted("call", "tool", False, summarize_result(result)))
+    )
+    lines = output.getvalue().splitlines()
+    elbow = next(index for index, line in enumerate(lines) if "⎿" in line)
+    return lines[elbow:]
+
+
+def test_a_command_result_reads_by_both_ends_on_one_line():
+    shown = _settled_elbow(_TEST_RUN)
+
+    assert len(shown) == 1
+    assert "test session starts ===== … ===== 360 passed" in shown[0]
+
+
+def test_a_two_line_command_result_shows_both_lines_side_by_side():
+    (elbow,) = _settled_elbow("[exit 1]\nnpm ERR! missing script: test")
+
+    assert "[exit 1] · npm ERR! missing script: test" in elbow
+
+
+def test_a_result_without_its_card_reads_by_its_first_line():
+    output = io.StringIO()
+    renderer = EventRenderer(Console(file=output, color_system=None, width=100))
+    renderer.on_event(
+        Event("1", ToolCompleted("lost", "bash", False, "first\nsecond\nlast"))
+    )
+
+    elbow = output.getvalue().splitlines()[-1]
+    assert "first" in elbow and "last" not in elbow
+
+
+def test_other_tools_say_what_came_back_by_their_first_line():
+    listing = "\n".join(f"src/file_{index}.py" for index in range(20))
+    (elbow,) = _settled_elbow(listing, kind=ToolActivityKind.LIST)
+
+    assert "src/file_0.py" in elbow
+    assert "file_19" not in elbow
+
+
+def test_a_short_first_line_leaves_the_room_to_the_last():
+    from cli.tui.renderer import _fit_ends
+
+    shown = _fit_ends(
+        "[exit 1]",
+        "AssertionError: expected 3, got 4 in test_calculator",
+        40,
+        skipped=True,
+    )
+    assert shown.startswith("[exit 1] … AssertionError: expected 3")
+    # The short first line takes only what it needs; the rest goes to the last.
+    assert 38 <= len(shown) <= 40
+
+
+def test_a_last_line_the_preview_cut_into_keeps_its_end():
+    # Longer than the preview holds, so the preview cuts into the last line.
+    shown = _settled_elbow("start\n" + "x" * 600 + " the real end", width=60)
+
+    assert shown[0].rstrip().endswith("the real end")
+
+
+def test_the_verbose_transcript_shows_what_came_back():
+    elbow, *below = _settled_elbow(_TEST_RUN, mode=TranscriptMode.VERBOSE)
+
+    assert "360 passed" in elbow
+    assert any("tests/test_0.py" in line for line in below)
+    assert any(line.strip() == "…" for line in below)
+    assert below[-1].strip() == "===== 360 passed in 1.2s ====="
+
+
+def test_verbose_wraps_a_long_line_under_the_elbow():
+    error = "Error: " + "configuration key not found " * 8
+    elbow, *below = _settled_elbow(error, mode=TranscriptMode.VERBOSE, width=60)
+
+    assert len(below) >= 2
+    assert all(line.startswith("   ") for line in below)
+    assert "".join(line.strip() for line in below).count("configuration") == 8
+
+
+def test_verbose_output_wraps_cjk_without_splitting_words():
+    output = (
+        "先看一下这个函数里面的处理逻辑handle_relic_offer然后再决定怎么修改它的返回值。"
+    )
+    elbow, *below = _settled_elbow(output, mode=TranscriptMode.VERBOSE, width=40)
+
+    assert len(below) >= 2
+    assert any("handle_relic_offer" in line for line in below)
+    assert not any(line.strip().startswith("。") for line in below)
+
+
+def test_verbose_survives_a_terminal_a_few_columns_wide():
+    shown = _settled_elbow(_TEST_RUN, mode=TranscriptMode.VERBOSE, width=5)
+
+    assert shown
+
+
+def test_a_line_cut_at_both_ends_carries_one_mark_between_them():
+    from cli.tui.renderer import _fit_ends
+    from core.events.protocol import summarize_result
+
+    head, _, tail = summarize_result("x" * 500).split("\n")
+    shown = _fit_ends(head, tail, 40, skipped=True)
+
+    assert shown.count("…") == 1
+
+
+def test_elbow_names_its_card_only_while_calls_overlap():
+    output = io.StringIO()
+    renderer = EventRenderer(
+        Console(file=output, color_system=None, width=100),
+        workspace="/repo",
+    )
+
+    def start(call_id: str, subject: str) -> None:
+        renderer.on_event(
+            Event(
+                call_id,
+                ToolStarted(
+                    call_id,
+                    "read",
+                    activity=ToolActivity(ToolActivityKind.READ, "Read", subject),
+                ),
+            )
+        )
+
+    # One call at a time: the elbow sits under its own card, so repeating
+    # the subject would be noise.
+    start("solo", "/repo/a.py")
+    renderer.on_event(Event("2", ToolCompleted("solo", "read", False, "ok")))
+    solo_elbow = output.getvalue().splitlines()[-1]
+    assert "a.py" not in solo_elbow
+
+    # Two in flight settle out of order, so each elbow has to say which.
+    start("first", "/repo/first.py")
+    start("second", "/repo/second.py")
+    renderer.on_event(Event("3", ToolCompleted("second", "read", False, "ok")))
+    renderer.on_event(Event("4", ToolCompleted("first", "read", False, "ok")))
+    elbows = output.getvalue().splitlines()[-2:]
+    assert "second.py" in elbows[0]
+    assert "first.py" in elbows[1]
+
+
+def test_plan_card_draws_the_checklist_once_per_change():
+    output = io.StringIO()
+    renderer = EventRenderer(Console(file=output, color_system=None, width=100))
+    plan = PlanUpdated(
+        plan=(
+            PlanStep("survey the workspace", PlanStepStatus.COMPLETED),
+            PlanStep("read the largest file", PlanStepStatus.IN_PROGRESS),
+            PlanStep("summarise it", PlanStepStatus.PENDING),
+        )
+    )
+
+    renderer.on_event(Event("1", plan))
+    renderer.on_event(Event("2", plan))  # unchanged: nothing new to say
+
+    rendered = output.getvalue()
+    assert rendered.count("survey the workspace") == 1
+    assert "1/3" in rendered
+    assert "read the largest file" in rendered
+    assert "summarise it" in rendered
+
+
+def test_plan_card_replaces_the_generic_card_for_the_plan_tool():
+    """dsh's rule: a keyed tool view REPLACES the generic row.
+
+    The kernel emits ToolStarted(update_plan) → PlanUpdated →
+    ToolCompleted(update_plan). Rendering all three would announce the same
+    act three times.
+    """
+    output = io.StringIO()
+    renderer = EventRenderer(Console(file=output, color_system=None, width=100))
+
+    renderer.on_event(
+        Event(
+            "1",
+            ToolStarted(
+                "plan-1",
+                "update_plan",
+                activity=ToolActivity(ToolActivityKind.PLAN, "Update plan", ""),
+            ),
+        )
+    )
+    renderer.on_event(
+        Event(
+            "2",
+            PlanUpdated(plan=(PlanStep("read the repo", PlanStepStatus.IN_PROGRESS),)),
+        )
+    )
+    renderer.on_event(
+        Event("3", ToolCompleted("plan-1", "update_plan", False, "☐ read the repo"))
+    )
+
+    rendered = output.getvalue()
+    assert "Update plan" not in rendered
+    assert rendered.count("read the repo") == 1
+    assert "Plan" in rendered
+
+
+def test_a_failed_plan_call_still_reports_itself():
+    output = io.StringIO()
+    renderer = EventRenderer(Console(file=output, color_system=None, width=100))
+
+    renderer.on_event(
+        Event(
+            "1",
+            ToolStarted(
+                "plan-1",
+                "update_plan",
+                activity=ToolActivity(ToolActivityKind.PLAN, "Update plan", ""),
+            ),
+        )
+    )
+    # No PlanUpdated: the kernel only projects one on success.
+    renderer.on_event(
+        Event(
+            "2",
+            ToolCompleted("plan-1", "update_plan", True, "two steps are in_progress"),
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "update_plan failed" in rendered
+    assert "two steps are in_progress" in rendered
+
+
+def test_turn_footer_reports_usage_and_stays_silent_without_it():
+    def run(with_usage: bool) -> str:
+        output = io.StringIO()
+        renderer = EventRenderer(Console(file=output, color_system=None, width=100))
+        renderer.on_event(Event("1", TurnStarted()))
+        if with_usage:
+            renderer.on_event(
+                Event(
+                    "2",
+                    ModelUsageRecorded(
+                        1, {"prompt_tokens": 12480, "completion_tokens": 842}
+                    ),
+                )
+            )
+        renderer.on_event(Event("3", TaskComplete("done", "completed")))
+        return output.getvalue()
+
+    settled = run(True)
+    assert "12.5k in" in settled
+    assert "842 out" in settled
+    # A stopwatch reading alone is not worth a line.
+    assert run(False).strip() == ""
+
+
+def test_summary_mode_suppresses_stream_but_keeps_final_answer():
+    output = io.StringIO()
+    renderer = EventRenderer(
+        Console(file=output, color_system=None, width=120),
+        transcript_mode=TranscriptMode.SUMMARY,
+    )
+
+    renderer.on_event(Event("1", AgentMessageDelta("final answer", "message-1")))
+    renderer.on_event(
+        Event(
+            "2",
+            AgentMessageCompleted(
+                "message-1",
+                "final answer",
+            ),
+        ),
+    )
+    renderer.on_event(Event("3", AgentMessage("final answer", "message-1")))
+
+    assert output.getvalue().count("final answer") == 1
+
+
+def test_interactive_input_accepts_status_and_transcript_callbacks(
+    monkeypatch,
+    tmp_path,
+):
+    captured: dict[str, Any] = {}
+
+    class InteractiveInput(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    class FakePromptSession:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr("sys.stdin", InteractiveInput())
+    monkeypatch.setattr("cli.tui.input.PromptSession", FakePromptSession)
+    monkeypatch.setattr("cli.tui.input._HISTORY_PATH", tmp_path / "history")
+
+    def status_provider() -> str:
+        return "Thinking"
+
+    def toggle() -> str:
+        return "verbose"
+
+    reader = InputReader(
+        str(tmp_path),
+        status_provider=status_provider,
+        toggle_transcript=toggle,
+    )
+
+    assert reader.interactive is True
+    assert captured["bottom_toolbar"] is status_provider
+    # No metronome: prompt_toolkit's refresh_interval repaints at a fixed
+    # rate whether or not anything moves, and at animation speed that cost
+    # ~10% of a core on an idle TUI. Repaints are driven by the activity
+    # probe instead (see `_animate`).
+    assert "refresh_interval" not in captured
+    # `bottom-toolbar` ships as a solid reversed bar; the TUI is borderless.
+    assert "noreverse" in captured["style"].style_rules[0][1]
+
+
+def test_skill_command_is_one_turn_only_and_persists_invocation_metadata(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    workspace = tmp_path / "ws"
+    skill = workspace / ".deepcode" / "skills" / "review"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\n"
+        "name: review\n"
+        "description: Review a change\n"
+        "---\n"
+        "Inspect concrete evidence.\n",
+        encoding="utf-8",
+    )
+
+    rc, provider = _run_tui(
+        monkeypatch,
+        tmp_path,
+        "/skill missing\n/skills\n/skill review\nrun review\n/exit\n",
+        ["review complete"],
+    )
+
+    assert rc == 0
+    assert provider.calls == 1
+    output = capsys.readouterr().out
+    assert "Skill error:" in output
+    assert "selected review for the next Turn" in output
+    assert "Skill review (explicit)" in output
+
+    from core.sessions.store import SessionStore
+
+    store = SessionStore(tmp_path / "sessions")
+    stored = store.get_session(store.list_sessions()[0].session_id)
+    assert stored is not None
+    invocation = stored.messages[0].metadata["skillInvocations"][0]
+    assert invocation["name"] == "review"
+    assert invocation["invocation"] == "explicit"
+
+
+def test_skills_command_prints_catalog_warnings(monkeypatch, tmp_path, capsys):
+    skill = tmp_path / "ws" / ".agents" / "skills" / "commit"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\n"
+        "name: commit\n"
+        "description: Commit the change\n"
+        "allowed-tools: Bash(git status:*), Read\n"
+        "---\n"
+        "Commit with a clear message.\n",
+        encoding="utf-8",
+    )
+
+    rc, _provider = _run_tui(monkeypatch, tmp_path, "/skills\n/exit\n", [])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "commit" in output
+    assert "warning:" in output
+    assert "argument patterns are not enforced" in output
+
+
+def _configure_fake_goal_provider(monkeypatch, tmp_path) -> None:
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("DEEPCODE_HOME", str(home))
+    (home / "deepcode_config.json").write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "defaults": {
+                        "connection": "legacy",
+                        "model": "fake-model",
+                    }
+                },
+                "providers": {
+                    "profiles": {
+                        "legacy": {
+                            "template": "openai",
+                            "manualModels": ["fake-model"],
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_goal_command_uses_shared_goal_ledger_and_selected_skill(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    from core.domain import ThreadGoalStatus
+    from core.sessions import SessionStore, ThreadGoalStore
+
+    workspace = tmp_path / "ws"
+    skill = workspace / ".deepcode" / "skills" / "review"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\n"
+        "name: review\n"
+        "description: Review the result\n"
+        "---\n"
+        "Inspect concrete evidence before declaring completion.\n",
+        encoding="utf-8",
+    )
+    _configure_fake_goal_provider(monkeypatch, tmp_path)
+
+    rc, provider = _run_tui(
+        monkeypatch,
+        tmp_path,
+        "/skill review\n/goal inspect and finish the work\n/goal wait\n/exit\n",
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(id="goal-read", name="get_goal", arguments={})
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="goal-complete",
+                        name="update_goal",
+                        arguments={
+                            "status": "complete",
+                            "reason": "The requested work is complete.",
+                        },
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            "goal work complete",
+        ],
+    )
+
+    assert rc == 0
+    assert provider.calls == 3
+    output = capsys.readouterr().out
+    assert "Goal complete" in output
+    assert "The requested work is complete." in output
+    # The card's title is the identity a reader gets (dsh's rule); the wire
+    # name only reaches the transcript through that humanised label.
+    assert "Get Goal" in output
+    assert "Update Goal" in output
+
+    store = SessionStore(tmp_path / "sessions")
+    summary = store.list_sessions()[0]
+    goal = ThreadGoalStore(store).read(summary.session_id)
+    assert goal is not None
+    assert goal.status is ThreadGoalStatus.COMPLETE
+    assert goal.skill_ids
+    stored = store.get_session(summary.session_id)
+    assert stored is not None
+    invocations = stored.messages[0].metadata["skillInvocations"]
+    assert invocations[0]["name"] == "review"
+
+
+def test_goal_command_renders_tools_from_an_automatic_continuation(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    _configure_fake_goal_provider(monkeypatch, tmp_path)
+
+    rc, provider = _run_tui(
+        monkeypatch,
+        tmp_path,
+        "/goal finish across turns\n/goal wait\n/exit\n",
+        [
+            "The first Turn gathered evidence; more work remains.",
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="goal-complete-on-continuation",
+                        name="update_goal",
+                        arguments={
+                            "status": "complete",
+                            "reason": "The continuation finished the work.",
+                        },
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            "The Goal is complete.",
+        ],
+    )
+
+    assert rc == 0
+    assert provider.calls == 3
+    output = capsys.readouterr().out
+    assert "Update Goal" in output
+    assert "The continuation finished the work." in output
+
+
+def test_goal_edit_and_steer_remain_available_while_work_runs_in_background(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    from core.domain import ThreadGoalStatus
+    from core.sessions import SessionStore, ThreadGoalStore
+
+    _configure_fake_goal_provider(monkeypatch, tmp_path)
+    rc, _provider = _run_tui(
+        monkeypatch,
+        tmp_path,
+        (
+            "/goal preserve the current behavior\n"
+            "Keep the public API compatible.\n"
+            "/goal edit preserve the behavior and public API\n"
+            "/goal pause\n"
+            "/exit\n"
+        ),
+        ["work remains"],
+        first_call_delay=0.5,
+    )
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "Steered the active Turn" in output or "Queued — runs after" in output
+    assert "Goal saved with the same identity" in output
+    store = SessionStore(tmp_path / "sessions")
+    goal = ThreadGoalStore(store).read(store.list_sessions()[0].session_id)
+    assert goal is not None
+    assert goal.status is ThreadGoalStatus.PAUSED
+    assert goal.objective == "preserve the behavior and public API"
+
+
+def test_goal_edit_uses_stable_identity_without_a_revision_retry_loop():
+    from types import SimpleNamespace
+
+    from cli.tui.goal_controller import TuiGoalController
+    from core.domain import ThreadGoal
+
+    thread_id = "ses_goal_edit_retry"
+    original = ThreadGoal(
+        thread_id=thread_id,
+        objective="original objective",
+    )
+
+    class GoalExtension:
+        goal = original
+        edit_calls: ClassVar[list[dict[str, Any]]] = []
+
+        def read(self, requested_thread_id):
+            assert requested_thread_id == thread_id
+            return self.goal
+
+        def edit(self, requested_thread_id, **kwargs):
+            assert requested_thread_id == thread_id
+            self.edit_calls.append(kwargs)
+            self.goal = ThreadGoal(
+                thread_id=thread_id,
+                id=self.goal.id,
+                objective=kwargs["objective"],
+                status=self.goal.status,
+                token_budget=kwargs["token_budget"],
+                tokens_used=self.goal.tokens_used,
+                time_used_seconds=self.goal.time_used_seconds,
+                skill_ids=kwargs["skill_ids"],
+                created_at=self.goal.created_at,
+            )
+            return self.goal
+
+    extension = GoalExtension()
+    owner = SimpleNamespace(
+        thread_client=SimpleNamespace(
+            goals=extension,
+            session_id=thread_id,
+        )
+    )
+    controller = TuiGoalController(owner)
+
+    result = controller._edit("revised objective", resume=False)
+
+    assert len(extension.edit_calls) == 1
+    assert extension.edit_calls[0]["expected_goal_id"] == original.id
+    assert extension.edit_calls[0]["continue_work"] is True
+    assert extension.goal.id == original.id
+    assert extension.goal.objective == "revised objective"
+    assert "same identity" in result.message
+
+
+def test_goal_continue_command_uses_the_shared_goal_extension():
+    from types import SimpleNamespace
+
+    from cli.tui.goal_controller import TuiGoalController
+    from core.application.goal_extension import (
+        GoalContinueDisposition,
+        GoalContinueResult,
+    )
+    from core.domain import ThreadGoal
+
+    thread_id = "ses_goal_continue"
+    goal = ThreadGoal(thread_id=thread_id, objective="finish the task")
+
+    class GoalExtension:
+        def read(self, requested_thread_id):
+            assert requested_thread_id == thread_id
+            return goal
+
+        def continue_goal(
+            self,
+            requested_thread_id,
+            *,
+            expected_goal_id,
+            **_kwargs,
+        ):
+            assert requested_thread_id == thread_id
+            assert expected_goal_id == goal.id
+            return GoalContinueResult(
+                goal=goal,
+                disposition=GoalContinueDisposition.STARTED,
+                turn_id="turn_000000000000000000000001",
+            )
+
+    controller = TuiGoalController(
+        SimpleNamespace(
+            thread_client=SimpleNamespace(
+                goals=GoalExtension(),
+                session_id=thread_id,
+            )
+        )
+    )
+
+    result = asyncio.run(controller.execute("continue"))
+
+    assert "continuation started" in result.message
+    assert result.refresh_session is True
+
+
+def test_new_resets_history_and_model_switch_keeps_it(monkeypatch, tmp_path, capsys):
+    rc, _provider = _run_tui(
+        monkeypatch,
+        tmp_path,
+        "hello\n/new\n/model other-model\n/exit\n",
+        ["hi there"],
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "started a new conversation" in out
+    assert "model switched to other-model" in out
+
+
+def test_effort_switch_preserves_history_and_session_selection(
+    monkeypatch, tmp_path, capsys
+):
+    rc, provider = _run_tui(
+        monkeypatch,
+        tmp_path,
+        "hello\n/effort high\ncontinue\n/exit\n",
+        ["first reply", "second reply"],
+    )
+
+    assert rc == 0
+    assert provider.calls == 2
+    assert "effort switched to High" in capsys.readouterr().out
+
+    from core.sessions.store import SessionStore
+
+    store = SessionStore(tmp_path / "sessions")
+    stored = store.get_session(store.list_sessions()[0].session_id)
+    assert stored is not None
+    assert stored.metadata["reasoning_effort"] == "high"
+    assert [message.content for message in stored.messages] == [
+        "hello",
+        "first reply",
+        "continue",
+        "second reply",
+    ]
+
+
+def test_context_switch_preserves_history_and_session_selection(
+    monkeypatch, tmp_path, capsys
+):
+    rc, provider = _run_tui(
+        monkeypatch,
+        tmp_path,
+        "hello\n/context 64k\ncontinue\n/exit\n",
+        ["first reply", "second reply"],
+    )
+
+    assert rc == 0
+    assert provider.calls == 2
+    assert "context cap switched to 64000 tokens" in capsys.readouterr().out
+
+    from core.sessions.store import SessionStore
+
+    store = SessionStore(tmp_path / "sessions")
+    stored = store.get_session(store.list_sessions()[0].session_id)
+    assert stored is not None
+    assert stored.metadata["context_window"] == 64_000
+    assert [message.content for message in stored.messages] == [
+        "hello",
+        "first reply",
+        "continue",
+        "second reply",
+    ]
+
+
+def test_clear_keeps_the_same_persistent_session(monkeypatch, tmp_path, capsys):
+    rc, _ = _run_tui(
+        monkeypatch,
+        tmp_path,
+        "before clear\n/clear\nafter clear\n/exit\n",
+        ["first reply", "second reply"],
+    )
+    assert rc == 0
+
+    from core.sessions.store import SessionStore
+
+    sessions = SessionStore(tmp_path / "sessions").list_sessions()
+    assert len(sessions) == 1
+    assert sessions[0].message_count == 4
+
+
+def test_session_persisted_and_resumable(monkeypatch, tmp_path, capsys):
+    # Conversation 1: one turn, then read the store to find the session id.
+    rc, _ = _run_tui(
+        monkeypatch, tmp_path, "remember the number 42\n/exit\n", ["noted: 42"]
+    )
+    assert rc == 0
+    from core.sessions.store import SessionStore
+
+    store = SessionStore(tmp_path / "sessions")
+    sessions = store.list_sessions()
+    assert len(sessions) == 1
+    sid = sessions[0].session_id
+    assert sessions[0].message_count == 2  # user + assistant
+    # The session was titled from the first message.
+    assert "remember the number" in sessions[0].title
+
+    # Conversation 2: /resume restores the transcript into the live agent.
+    rc2, _provider2 = _run_tui(
+        monkeypatch,
+        tmp_path,
+        f"/resume {sid}\nwhat number?\n/exit\n",
+        ["you said 42"],
+    )
+    assert rc2 == 0
+    out = capsys.readouterr().out
+    assert f"resumed {sid}" in out
+
+
+def test_startup_resume_shows_history_without_running_another_turn(
+    monkeypatch, tmp_path, capsys
+):
+    from core.sessions.store import SessionStore
+
+    rc, provider = _run_tui(
+        monkeypatch,
+        tmp_path,
+        "Remember this greeting task\n/exit\n",
+        ["Greeting tests passed"],
+    )
+    assert rc == 0
+    store = SessionStore(tmp_path / "sessions")
+    session = store.list_sessions()[0]
+    capsys.readouterr()
+    monkeypatch.setattr("sys.stdin", io.StringIO("/exit\n"))
+
+    assert (
+        tui_app.main(
+            ["--workspace", str(tmp_path / "ws"), "--resume", session.session_id]
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "Remember this greeting task" in output
+    assert "Greeting tests passed" in output
+    assert provider.calls == 1
+    assert len(store.list_sessions()) == 1
+    assert store.list_sessions()[0].message_count == session.message_count
+
+
+def test_resume_replay_shows_only_what_people_said(monkeypatch, tmp_path, capsys):
+    from core.sessions.store import SessionStore
+
+    rc, _ = _run_tui(monkeypatch, tmp_path, "Fix the parser\n/exit\n", ["Fixed it."])
+    assert rc == 0
+    store = SessionStore(tmp_path / "sessions")
+    session_id = store.list_sessions()[0].session_id
+    store.append_message(
+        session_id,
+        "user",
+        "Continue working toward the active Thread Goal.\nGoal: ship it",
+        metadata={"source": "goal_continuation", "client": "internal"},
+    )
+    store.append_message(
+        session_id,
+        "user",
+        "The persistent Goal for this Thread was updated.",
+        metadata={"source": "goal_update", "delivery": "between_turns"},
+    )
+    store.append_message(session_id, "assistant", "Shipped.")
+    capsys.readouterr()
+    monkeypatch.setattr("sys.stdin", io.StringIO("/exit\n"))
+
+    assert (
+        tui_app.main(["--workspace", str(tmp_path / "ws"), "--resume", session_id]) == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "› Fix the parser" in output
+    assert f"{theme.GOAL_PROMPT_MARK} Goal continued automatically" in output
+    assert "Continue working toward" not in output
+    assert "was updated" not in output
+    assert "Shipped." in output
+
+
+def test_resume_without_arg_lists_sessions(monkeypatch, tmp_path, capsys):
+    _run_tui(monkeypatch, tmp_path, "task one\n/exit\n", ["done"])
+    capsys.readouterr()
+    rc, _ = _run_tui(monkeypatch, tmp_path, "/resume\n/exit\n", ["unused"])
+    assert rc == 0
+    assert "recent Sessions" in capsys.readouterr().out
+
+
+# --- directory scoping (P2-L5c: central storage, per-directory view) --------
+
+
+def test_session_metadata_stamped(monkeypatch, tmp_path, capsys):
+    _run_tui(monkeypatch, tmp_path, "hello\n/exit\n", ["hi"], workspace="A")
+    from core.sessions.store import SessionStore
+
+    store = SessionStore(tmp_path / "sessions")
+    stored = store.get_session(store.list_sessions()[0].session_id)
+    assert stored.metadata.get("kind") == "tui"
+    assert stored.metadata.get("workspace") == str(tmp_path / "A")
+
+
+def test_resume_scoped_to_directory(monkeypatch, tmp_path, capsys):
+    # A conversation born in directory A...
+    _run_tui(monkeypatch, tmp_path, "task in A\n/exit\n", ["done A"], workspace="A")
+    capsys.readouterr()
+    # ...is invisible from directory B's default picker, visible via `all`
+    # with its origin annotated.
+    rc, _ = _run_tui(
+        monkeypatch,
+        tmp_path,
+        "/resume\n/resume all\n/exit\n",
+        ["unused"],
+        workspace="B",
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no Sessions for this directory" in out
+    assert "task in A" in out  # shown in the `all` view
+    # Origin directory annotated, exactly as the picker names it: a path under
+    # the home directory is `~`-folded (pytest's tmp dir lives under $HOME on
+    # Windows, and does not on POSIX, so compare against the folded form).
+    assert short_path(str(tmp_path / "A")) in out
+
+
+def test_cross_directory_resume_hints_origin(monkeypatch, tmp_path, capsys):
+    _run_tui(monkeypatch, tmp_path, "remember A\n/exit\n", ["ok"], workspace="A")
+    capsys.readouterr()
+    from core.sessions.store import SessionStore
+
+    store = SessionStore(tmp_path / "sessions")
+    sid = store.list_sessions()[0].session_id
+    rc, _ = _run_tui(
+        monkeypatch, tmp_path, f"/resume {sid}\n/exit\n", ["unused"], workspace="B"
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert f"resumed {sid}" in out
+    assert "started in" in out and str(tmp_path / "A") in out
+
+
+def test_same_directory_resume_has_no_hint(monkeypatch, tmp_path, capsys):
+    _run_tui(monkeypatch, tmp_path, "stay here\n/exit\n", ["ok"], workspace="A")
+    capsys.readouterr()
+    from core.sessions.store import SessionStore
+
+    store = SessionStore(tmp_path / "sessions")
+    sid = store.list_sessions()[0].session_id
+    _run_tui(
+        monkeypatch, tmp_path, f"/resume {sid}\n/exit\n", ["unused"], workspace="A"
+    )
+    out = capsys.readouterr().out
+    assert f"resumed {sid}" in out
+    assert "started in" not in out
+
+
+def test_expand_file_refs(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "notes.txt").write_text("the secret is blue\n")
+    expanded = expand_file_refs("summarize @notes.txt please", str(ws))
+    assert "the secret is blue" in expanded
+    assert "attached file: notes.txt" in expanded
+    # Non-file tokens stay untouched, no attachment added.
+    assert expand_file_refs("email @bob about it", str(ws)) == "email @bob about it"
+
+
+def test_file_refs_fenced_to_workspace(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (tmp_path / "outside.txt").write_text("secret")
+    out = expand_file_refs("read @../outside.txt", str(ws))
+    assert "secret" not in out  # escape attempt is not attached
+
+
+@pytest.mark.asyncio
+async def test_interactive_ctrl_c_becomes_a_turn_interrupt_request(monkeypatch) -> None:
+    """Ctrl-C at the prompt interrupts the turn; it must not end the session.
+
+    ``patch_stdout`` is stubbed out: it builds a prompt_toolkit output, which
+    wants a real console (on Windows pytest gets
+    ``NoConsoleScreenBufferError: Found xterm-256color``), and the stdout
+    patching has nothing to do with the interrupt mapping under test.
+    """
+
+    monkeypatch.setattr(
+        "cli.tui.input.patch_stdout", lambda **_kwargs: contextlib.nullcontext()
+    )
+
+    class InterruptingPrompt:
+        async def prompt_async(self, _prompt: str) -> str:
+            raise KeyboardInterrupt
+
+    reader = InputReader.__new__(InputReader)
+    reader.interactive = True
+    reader._prompt_session = InterruptingPrompt()
+
+    with pytest.raises(InputInterrupted):
+        await reader.read()
+
+
+def test_rename_command_updates_the_stored_session_title(monkeypatch, tmp_path, capsys):
+    rc, _provider = _run_tui(
+        monkeypatch,
+        tmp_path,
+        "hello\n/rename Renamed conversation\n/exit\n",
+        ["hi"],
+    )
+    assert rc == 0
+    assert "Session renamed to Renamed conversation" in capsys.readouterr().out
+
+    from core.sessions.store import SessionStore
+
+    store = SessionStore(tmp_path / "sessions")
+    assert store.list_sessions()[0].title == "Renamed conversation"
+
+
+def test_delete_command_removes_a_stored_session_but_needs_an_id(
+    monkeypatch, tmp_path, capsys
+):
+    rc, _provider = _run_tui(
+        monkeypatch,
+        tmp_path,
+        "first conversation\n/exit\n",
+        ["reply"],
+    )
+    assert rc == 0
+
+    from core.sessions.store import SessionStore
+
+    store = SessionStore(tmp_path / "sessions")
+    victim = store.list_sessions()[0].session_id
+
+    rc, _provider = _run_tui(
+        monkeypatch,
+        tmp_path,
+        f"/delete\n/delete {victim}\n/exit\n",
+        [],
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "usage: /delete" in out
+    assert f"deleted Session {victim}" in out
+
+    store = SessionStore(tmp_path / "sessions")
+    assert victim not in [s.session_id for s in store.list_sessions()]
+
+
+def test_retry_command_reruns_the_last_turn_as_a_new_turn(
+    monkeypatch, tmp_path, capsys
+):
+    rc, provider = _run_tui(
+        monkeypatch,
+        tmp_path,
+        "solve the task\n/retry\n/exit\n",
+        ["first answer", "second answer"],
+    )
+    assert rc == 0
+    assert provider.calls == 2
+    out = capsys.readouterr().out
+    assert "retrying: solve the task" in out
+
+    from core.sessions.store import SessionStore
+
+    store = SessionStore(tmp_path / "sessions")
+    stored = store.get_session(store.list_sessions()[0].session_id)
+    assert stored is not None
+    assert [message.content for message in stored.messages] == [
+        "solve the task",
+        "first answer",
+        "solve the task",
+        "second answer",
+    ]
+
+
+def test_command_argument_completion_comes_from_the_registry(tmp_path):
+    from prompt_toolkit.document import Document
+
+    from cli.tui.input import TuiCompleter
+
+    completer = TuiCompleter(str(tmp_path))
+    completer.set_argument_provider(
+        lambda name, prefix: ["86db0319"] if name == "resume" else []
+    )
+
+    def texts(line: str) -> list[str]:
+        return [
+            completion.text
+            for completion in completer.get_completions(Document(line), None)
+        ]
+
+    assert texts("/resume 86") == ["86db0319"]
+    assert texts("/resume 86db0319 extra") == []  # only the first argument
+    assert texts("/rename my title") == []  # no provider, no path noise
+
+
+def test_picker_filters_by_title_and_wraps_navigation():
+    from cli.tui.picker import Picker, PickerItem, PickerScope
+
+    picker = Picker(
+        [
+            PickerScope(
+                "scope",
+                [
+                    PickerItem(1, "Alpha task", "aa11"),
+                    PickerItem(2, "Beta task", "bb22"),
+                    PickerItem(3, "Gamma", "cc33", disabled_reason="current Session"),
+                ],
+            )
+        ],
+        title="Pick",
+    )
+    picker._buffer.text = "beta"
+    assert [item.title for item in picker._filtered()] == ["Beta task"]
+    picker._buffer.text = "bb2"  # detail (id) matches too
+    assert [item.title for item in picker._filtered()] == ["Beta task"]
+    picker._buffer.text = ""
+    picker._move(-1)
+    assert picker._selected == 2  # wraps to the end
+    picker._move(1)
+    assert picker._selected == 0
+
+
+def test_picker_shift_tab_cycles_the_highlighted_variant():
+    from cli.tui.picker import Picker, PickerItem, PickerScope, PickerVariant
+
+    ladder = tuple(PickerVariant(value=v, label=v) for v in ("auto", "high", "xhigh"))
+    item = PickerItem(1, "route", variants=ladder, initial_variant=1)
+    plain = PickerItem(2, "no ladder")
+    picker = Picker([PickerScope("scope", [item, plain])], title="Pick")
+    assert picker._variant_of(item).value == "high"
+    picker._cycle_variant(item)
+    assert picker._variant_of(item).value == "xhigh"
+    picker._cycle_variant(item)
+    assert picker._variant_of(item).value == "auto"  # wraps
+    assert picker._variant_of(plain) is None
+    picker._cycle_variant(plain)  # no-op, no crash
+    assert picker._variant_of(plain) is None
+
+
+def test_model_picker_offers_the_full_directory_and_switches(monkeypatch):
+    from types import SimpleNamespace
+
+    import cli.tui.commands as commands_mod
+
+    seen: dict[str, Any] = {}
+
+    class FakePicker:
+        def __init__(self, scopes, *, title, initial_scope=0, variant_hint="variant"):
+            seen["scopes"] = scopes
+            seen["variant_hint"] = variant_hint
+
+        async def run(self):
+            from cli.tui.picker import PickerChoice
+
+            return PickerChoice(value=("openrouter", "model-b"), variant="high")
+
+    monkeypatch.setattr(commands_mod, "Picker", FakePicker)
+
+    async def switch_model(model, *, connection_id=None, reasoning_effort=None):
+        seen["switch"] = (connection_id, model, reasoning_effort)
+
+    directory = [
+        (
+            "openrouter",
+            [
+                {
+                    "id": "model-a",
+                    "name": "Model A",
+                    "contextWindow": 131072,
+                    "reasoning": {"supportedEfforts": ["high", "xhigh"]},
+                },
+                {"id": "model-b", "name": "model-b", "reasoning": None},
+            ],
+        ),
+        ("poe", [{"id": "gpt-x", "name": "GPT X", "reasoning": None}]),
+    ]
+
+    async def refresh_execution_state():
+        return None
+
+    app = SimpleNamespace(
+        reader=SimpleNamespace(interactive=True),
+        console=SimpleNamespace(print=lambda *a, **k: None),
+        refresh_execution_state=refresh_execution_state,
+        connection_model_catalog=lambda: directory,
+        thread_client=SimpleNamespace(
+            execution_profile=SimpleNamespace(
+                connection_id="openrouter", model_id="model-a"
+            ),
+            has_active_turn=lambda: False,
+        ),
+        switch_model=switch_model,
+        model="model-b",
+        requested_reasoning_effort="high",
+        reasoning_options=lambda model_id, connection_id=None: (),
+        model_catalog_note=lambda: None,
+    )
+    status = asyncio.run(commands_mod._cmd_model(app, ""))
+    assert seen["switch"] == ("openrouter", "model-b", "high")
+    assert "model switched to model-b" in status
+
+    items = list(seen["scopes"][0].items)
+    # The current route is pinned first with its published ladder.
+    assert items[0].value == ("openrouter", "model-a")
+    assert "current" in items[0].detail and "131K ctx" in items[0].detail
+    assert [variant.value for variant in items[0].variants] == [
+        "auto",
+        "high",
+        "xhigh",
+    ]
+    assert items[0].initial_variant == 1  # the session's requested effort
+    # Every connection's directory is offered; no invented ladders.
+    assert [item.value for item in items[1:]] == [
+        ("openrouter", "model-b"),
+        ("poe", "gpt-x"),
+    ]
+    assert items[1].variants == ()
+
+
+def test_resume_picker_marks_current_session_and_resumes_choice(monkeypatch):
+    from types import SimpleNamespace
+
+    import cli.tui.commands as commands_mod
+
+    seen: dict[str, Any] = {}
+
+    class FakePicker:
+        def __init__(self, scopes, *, title, initial_scope=0):
+            seen["scopes"] = scopes
+            seen["initial_scope"] = initial_scope
+
+        async def run(self):
+            from cli.tui.picker import PickerChoice
+
+            return PickerChoice(value="bb22cc33")
+
+    monkeypatch.setattr(commands_mod, "Picker", FakePicker)
+
+    def listing(session_id, title, current=False):
+        from datetime import UTC, datetime
+
+        return SimpleNamespace(
+            session_id=session_id,
+            title=title,
+            message_count=2,
+            updated_at=datetime.now(UTC),
+            workspace="/ws",
+            is_current=current,
+        )
+
+    rows = [
+        listing("aa11bb22", "Current one", current=True),
+        listing("bb22cc33", "Older one"),
+    ]
+    app = SimpleNamespace(
+        reader=SimpleNamespace(interactive=True),
+        workspace="/ws",
+        thread_client=SimpleNamespace(
+            list_recent=lambda *, limit, include_all: rows,
+            session_id="aa11bb22",
+        ),
+        resume_conversation=lambda sid: seen.setdefault("resumed", sid) and 2 or 2,
+        render_resume_tail=lambda: None,
+        bridge=SimpleNamespace(stored_workspace=lambda: "/ws"),
+    )
+    status = asyncio.run(commands_mod._cmd_resume(app, ""))
+    assert seen["resumed"] == "bb22cc33"
+    assert "resumed bb22cc33" in status
+    local_items = list(seen["scopes"][0].items)
+    assert local_items[0].disabled_reason == "current Session"
+    assert local_items[1].disabled_reason is None
+
+
+def test_agent_preset_overview_shows_the_deny_list(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("DEEPCODE_HOME", str(tmp_path / "home"))
+    presets = tmp_path / ".agents" / "presets"
+    presets.mkdir(parents=True)
+    (presets / "deny-only.md").write_text(
+        "---\ndescription: deny only\ndisallowed-tools: write, edit\n---\nbody",
+        encoding="utf-8",
+    )
+    (presets / "allow-and-deny.md").write_text(
+        "---\n"
+        "description: allow and deny\n"
+        "tools: read, bash\n"
+        "disallowed-tools: write\n"
+        "---\nbody",
+        encoding="utf-8",
+    )
+    stub = SimpleNamespace(
+        thread_client=SimpleNamespace(
+            workspace=str(tmp_path),
+            current_agent_preset_id=lambda: None,
+        )
+    )
+    # Unbound call: the method only touches thread_client, no TuiApp state.
+    overview = tui_app.TuiApp.agent_preset_overview(stub)
+    # A deny-only preset must not claim "all tools" (the reviewer's point).
+    assert "all tools except write, edit" in overview
+    assert "read, bash except write" in overview
+
+
+def test_efforts_read_as_the_desktop_names_them():
+    from cli.tui.text import effort_label
+
+    assert [
+        effort_label(value)
+        for value in (None, "auto", "none", "off", "low", "high", "xhigh", "max")
+    ] == ["Auto", "Auto", "Off", "Off", "Low", "High", "Extra high", "Max"]
+
+
+def test_tui_text_names_keys_one_way():
+    """Ctrl+O, Esc, Enter, Shift+Tab — as the guide and the status line write them."""
+    import ast
+
+    # Any spelling of a modifier key or Esc; only the guide's forms pass.
+    key = re.compile(
+        r"(?i)\b(?:ctrl|shift|alt)[-+]\w+|\besc(?:ape)?\b"
+        r"|\b(?:enter|tab) (?:select|scope|cancel)\b"
+    )
+    allowed = re.compile(
+        r"Ctrl\+[A-Z]|Shift\+Tab|Alt\+[A-Z]|Esc|(?:Enter|Tab) (?:select|scope|cancel)"
+    )
+    sources = [
+        *Path(ROOT, "cli", "tui").glob("*.py"),
+        Path(ROOT, "cli", "exec_cli.py"),
+        Path(ROOT, "cli", "automation_foreground.py"),
+    ]
+    offenders = []
+    for path in sources:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        docstrings = {
+            id(node.body[0].value)
+            for node in ast.walk(tree)
+            if isinstance(
+                node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+            )
+            and node.body
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+        }
+        # Key binding names (bindings.add("escape")) are code, not text.
+        bindings = {
+            id(argument)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add"
+            and "bindings" in ast.unparse(node.func.value)
+            for argument in node.args
+        }
+        offenders += [
+            f"{path.name}:{node.lineno}: {match.group()!r} in {node.value!r}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstrings | bindings
+            for match in key.finditer(node.value)
+            if not allowed.fullmatch(match.group())
+        ]
+    assert offenders == []
+
+
+def test_a_picker_row_is_found_by_the_value_you_would_type():
+    """The effort picker shows "Extra high"; Tab completion offers ``xhigh``."""
+    from cli.tui.picker import PickerItem
+
+    row = PickerItem(value="xhigh", title="Extra high", keywords="xhigh")
+    assert row.matches("xhigh") and row.matches("extra")
+    assert not row.matches("medium")
+    # A value that is not shown, such as a Skill's id, does not match.
+    skill = PickerItem(value="sk_0a1b2c3d4e5f", title="Review")
+    assert not skill.matches("sk_") and not skill.matches("a")
