@@ -1,0 +1,146 @@
+.header {
+  position: relative;
+  display: flex;
+  min-height: 58px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 14px 8px 24px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border-subtle) 78%, transparent);
+  background: var(--surface-overlay);
+  backdrop-filter: blur(22px);
+}
+
+.identity {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.breadcrumb {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font: var(--text-2xs) var(--font-ui);
+  white-space: nowrap;
+}
+
+.breadcrumb span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.titleRow {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.titleRow h1 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-display);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.beacon {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border: 1.5px solid var(--success);
+  border-radius: 50%;
+}
+
+.beacon[data-status="running"],
+.beacon[data-status="starting"] {
+  border-color: var(--signal);
+  background: var(--signal);
+  box-shadow: 0 0 0 4px var(--signal-soft);
+}
+
+.beacon[data-status="waiting"] {
+  border-color: var(--attention);
+  background: var(--attention);
+}
+
+.beacon[data-status="failed"],
+.beacon[data-status="crashed"],
+.beacon[data-status="stopped"] {
+  border-color: var(--danger);
+  background: var(--danger);
+}
+
+.actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+}
+
+.actions button,
+.trustState,
+.unavailableState {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  border-radius: var(--radius-xs);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+}
+
+.actions button:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+/* A status next to the buttons, set off by a thin rule after it. */
+.trustState {
+  margin-right: 6px;
+  padding-right: 12px;
+  border-right: 1px solid var(--border-subtle);
+  border-radius: 0;
+  color: var(--success);
+}
+
+.unavailableState {
+  color: var(--text-tertiary);
+}
+
+.actions .attentionAction {
+  background: var(--attention-soft);
+  color: var(--attention);
+}
+
+.actions .reviewAction[data-active="true"] {
+  background: var(--signal-soft);
+  color: var(--signal-strong);
+}
+
+@media (max-width: 820px) {
+  .header {
+    padding-inline: 16px;
+  }
+
+  .actions button:not(.reviewAction),
+  .trustState,
+  .unavailableState {
+    display: none;
+  }
+
+  .reviewAction {
+    font-size: 0;
+  }
+}

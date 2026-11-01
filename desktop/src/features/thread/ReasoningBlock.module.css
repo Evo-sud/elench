@@ -1,0 +1,126 @@
+.reasoning {
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  color: var(--text-tertiary);
+}
+
+.reasoning > summary {
+  display: grid;
+  min-height: 30px;
+  grid-template-columns: 16px minmax(0, 1fr) 14px;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  list-style: none;
+}
+
+.reasoning > summary::-webkit-details-marker {
+  display: none;
+}
+
+.reasoning > summary:hover {
+  background: var(--surface-hover);
+}
+
+.reasoning > summary > span {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.reasoning strong {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reasoning small {
+  flex: 0 0 auto;
+  color: var(--text-tertiary);
+  font: var(--text-2xs) var(--font-ui);
+}
+
+.reasoning[data-active="true"] {
+  color: var(--text-secondary);
+}
+
+.reasoning[data-active="true"] > summary > svg:first-child {
+  color: var(--signal);
+}
+
+.chevron {
+  transition: transform 150ms ease;
+}
+
+.reasoning[open] .chevron {
+  transform: rotate(90deg);
+}
+
+.spinner {
+  animation: reasoning-spin 1.15s linear infinite;
+}
+
+.content {
+  max-height: min(46vh, 430px);
+  margin: 2px 8px 8px 15px;
+  padding: 4px 6px 4px 17px;
+  overflow: auto;
+  border-left: 2px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.65;
+}
+
+.content > p {
+  margin: 0;
+}
+
+.trace {
+  margin-top: 13px;
+  padding-top: 11px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.trace h4 {
+  margin: 0 0 8px;
+  color: var(--text-tertiary);
+  font: var(--text-2xs) var(--font-ui);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+.traceDisclosure {
+  margin-top: 11px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.traceDisclosure > summary {
+  padding: 10px 0 3px;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  font: var(--text-2xs) var(--font-ui);
+}
+
+.waiting {
+  color: var(--text-tertiary);
+  font-style: italic;
+}
+
+@keyframes reasoning-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+  }
+}
