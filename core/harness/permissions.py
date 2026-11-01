@@ -1,0 +1,741 @@
+"""Three-valued permission engine for tool calls.
+
+Mechanism, not policy: this module *decides* allow / ask / deny for a tool
+invocation. It never prompts, executes, or talks to a model — callers wire
+the decision into the kernel (see ``AgentRunSpec.permission_checker``) and
+turn ``ASK`` into whatever their surface needs (auto-deny in headless runs,
+a real prompt in interactive ones).
+
+Design distilled from the reference harnesses (see
+docs/P1_SECURITY_BASE.md), adapted rather than copied:
+
+* **Central sensitive-path protection** (OpenHarness): credential stores
+  (``.ssh``, ``.aws/credentials``, ``.env`` …) are blocked ahead of rules in
+  legacy, Ask, and Read-only profiles. The explicit Full Access preset disables
+  this boundary together with the command sandbox, matching its honest
+  unrestricted-filesystem promise.
+* **Two-dimensional wildcard rules, last-match-wins** (opencode): a rule
+  matches on both the permission name (usually the tool name) and an
+  argument pattern (e.g. the bash command string or the target path), so
+  ``{"bash": {"git push *": "ask", "*": "allow"}}`` is expressible. Later
+  rules override earlier ones.
+* **Three modes**: ``default`` (mutating tools ask), ``plan`` (mutating
+  tools denied — read-only exploration), ``full_auto`` (rules only, no
+  implicit ask; used by non-interactive workflows).
+
+Evaluation precedence (first decisive wins):
+  1. sensitive-path protection          → DENY   (when enabled)
+  2. canonical Read only upper bound    → DENY   (mutating tools)
+  3. explicit rule match (last-wins)    → its action
+  4. mode default for read-only vs mutating tools; where that default is
+     ``allow``, an optional risk evaluator may raise it to ``ask`` (never
+     the other way)
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import os
+import re
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+
+from core.domain.execution_security import (
+    ApprovalPolicy,
+    ExecutionPermissionRuleSnapshot,
+    normalize_permission_rules,
+)
+from core.harness.risk_evaluator import RiskEvaluator
+
+
+class PermissionDecision(str, Enum):
+    ALLOW = "allow"
+    ASK = "ask"
+    DENY = "deny"
+
+
+class PermissionMode(str, Enum):
+    DEFAULT = "default"
+    PLAN = "plan"
+    FULL_AUTO = "full_auto"
+
+
+# Credential / secret locations protected by every profile except the explicit
+# Full Access preset. Rules cannot override this boundary while it is enabled.
+# Patterns are matched against normalized absolute
+# paths with fnmatch (``*`` spans path separators here, which is what we want:
+# ``*/.ssh/*`` should catch any depth). Kept deliberately small and auditable.
+# A credential directory is listed by itself too, since a search given the
+# directory reads everything in it.
+SENSITIVE_PATH_PATTERNS: tuple[str, ...] = (
+    "*/.ssh",
+    "*/.ssh/*",
+    "*/.aws",
+    "*/.aws/*",
+    "*/.config/gcloud",
+    "*/.config/gcloud/*",
+    "*/.azure",
+    "*/.azure/*",
+    "*/.gnupg",
+    "*/.gnupg/*",
+    "*/.docker/config.json",
+    "*/.kube/config",
+    "*/.netrc",
+    "*/.npmrc",
+    "*/.pypirc",
+    "*/.git-credentials",
+    "*/.deepcode/credentials*",
+    "*/deepcode_config.json",
+    "*/secrets.json",
+    "*/.env",
+    "*/.env.*",
+    "*.pem",
+    "*.key",
+    "*id_rsa*",
+    "*id_ed25519*",
+)
+
+# The stores above that sit at fixed places in the home directory. The OS
+# sandbox cannot match patterns, so bash and code mode are kept out of these
+# paths instead. Name patterns (.env, *.pem, *.key …) stay with the tools:
+# builds read files like those (certifi's cacert.pem, a project's .env). So
+# does ~/.npmrc, which also says which registry npm installs from.
+_SENSITIVE_HOME_PATHS: tuple[str, ...] = (
+    ".ssh",
+    ".aws",
+    ".config/gcloud",
+    ".azure",
+    ".gnupg",
+    ".docker/config.json",
+    ".kube/config",
+    ".netrc",
+    ".pypirc",
+    ".git-credentials",
+)
+# What in ~/.ssh is not secret and lets ssh reach a host through an agent
+# (SSH_AUTH_SOCK): its config, the host keys it trusts and public keys. Every
+# other file there, private keys whatever their name, stays out of reach.
+_SSH_PUBLIC_FILES = ("config", "config.d/*", "known_hosts*", "*.pub")
+
+# Argument keys whose value a permission rule pattern is matched against.
+_PATH_ARG_KEYS = ("file_path", "path", "root", "workspace_path", "target", "filename")
+# For the protected-path check an argument names a path when its key says so,
+# at any depth: MCP tools spell paths many ways (paths, source, destination,
+# output_dir ...). Values under other keys (content, pattern, query ...) are
+# left alone; text that merely mentions .env is not a path.
+_PATH_KEY = re.compile(
+    r"path|file|dir|folder|root|source|src|dest|dst|target|location|cwd",
+    re.IGNORECASE,
+)
+_PATCH_PATH_PREFIXES = (
+    "*** Add File: ",
+    "*** Update File: ",
+    "*** Delete File: ",
+    "*** Move to: ",
+)
+
+# Tool names that read state, or are otherwise side-effect-free w.r.t. the
+# workspace and security posture; safe to auto-allow in default mode and never
+# blocked by plan mode. Bare names + common MCP suffixes are matched.
+_READ_ONLY_TOOLS = frozenset(
+    {
+        "read_file",
+        "read_multiple_files",
+        "read_code_mem",
+        "get_file_structure",
+        "search_code",
+        "search_code_references",
+        "get_indexes_overview",
+        "get_operation_history",
+        "grep",
+        "glob",
+        "ls",
+        "list_dir",
+        "web_fetch",
+        "update_plan",  # self-maintained TODO plan — pure session state
+    }
+)
+
+
+@dataclass(frozen=True)
+class PermissionRule:
+    """A single ``(permission, pattern) -> action`` rule.
+
+    ``permission`` matches the tool name; ``pattern`` matches the argument
+    string (command line or path). Both use fnmatch; ``*`` matches anything.
+    """
+
+    permission: str
+    pattern: str
+    action: PermissionDecision
+
+    def matches(self, tool_name: str, argument: str) -> bool:
+        return fnmatch.fnmatch(tool_name, self.permission) and fnmatch.fnmatch(
+            argument, self.pattern
+        )
+
+
+def _normalize_path(raw: str, cwd: str | None) -> str:
+    try:
+        base = Path(cwd) if cwd else Path.cwd()
+        p = Path(os.path.expanduser(raw))
+        resolved = p if p.is_absolute() else (base / p)
+        return os.path.normpath(str(resolved))
+    except (OSError, ValueError):
+        return raw
+
+
+def is_sensitive_path(raw: str, cwd: str | None = None) -> bool:
+    """Whether ``raw`` names a protected credential location.
+
+    The path is checked as written and with symlinks resolved, so a link in
+    the workspace cannot reach ``~/.ssh/id_rsa``, and without regard to case,
+    since the default macOS and Windows filesystems ignore it.
+
+    Windows also drops trailing dots and spaces from path components at open
+    time while ``os.path.normpath`` keeps them (the literal name ``.env.``
+    opens ``.env`` yet a literal compare misses), so a stripped variant is
+    checked too. The strip is only a match probe — the reported path stays
+    as written.
+    """
+    normalized = _normalize_path(raw, cwd)
+    try:
+        candidates = {normalized, os.path.realpath(normalized)}
+    except (OSError, ValueError):
+        candidates = {normalized}
+    probes: set[str] = set()
+    for candidate in candidates:
+        probe = candidate.replace(os.sep, "/").casefold()
+        probes.add(probe)
+        # Keep "." and ".." components intact (rstrip would blank them).
+        probes.add("/".join(p.rstrip(" .") or p for p in probe.split("/")))
+    for probe in probes:
+        name = probe.rsplit("/", 1)[-1]
+        for pattern in SENSITIVE_PATH_PATTERNS:
+            if fnmatch.fnmatchcase(probe, pattern) or fnmatch.fnmatchcase(
+                name, pattern
+            ):
+                return True
+    return False
+
+
+# The files ``core.harness.hooks.discovery`` reads handlers from: the
+# user-level and workspace-level ``hooks.json``, plus the workspace
+# ``.claude/settings.json``. They are not secrets — reads stay free — but a
+# written-in handler runs commands in a later session, so a file-tool write
+# to one of them is surfaced for confirmation (see
+# ``PermissionEngine._evaluate``).
+_HOOK_CONFIG_SUFFIXES = ("/.deepcode/hooks.json", "/.claude/settings.json")
+
+
+def is_hook_config_path(raw: str, cwd: str | None = None) -> bool:
+    """Whether ``raw`` names one of the hook-discovery files.
+
+    Matched by suffix on the normalized, casefolded path, with symlinks
+    resolved and the same trailing-dot/space probe as
+    :func:`is_sensitive_path` (Windows drops those at open time, so
+    ``.claude/settings.json.`` still names the real file).
+    """
+    normalized = _normalize_path(raw, cwd)
+    try:
+        candidates = {normalized, os.path.realpath(normalized)}
+    except (OSError, ValueError):
+        candidates = {normalized}
+    for candidate in candidates:
+        probe = candidate.replace(os.sep, "/").casefold()
+        probes = {probe, "/".join(p.rstrip(" .") or p for p in probe.split("/"))}
+        if any(p.endswith(_HOOK_CONFIG_SUFFIXES) for p in probes):
+            return True
+    return False
+
+
+def sensitive_locations() -> tuple[str, ...]:
+    """The credential stores on this machine a sandboxed command may not read."""
+    from core.config import deepcode_home  # lazy: core.config is heavy
+
+    home = Path.home()
+    deepcode = deepcode_home()
+    return (
+        *(str(home / name) for name in _SENSITIVE_HOME_PATHS),
+        str(deepcode / "credentials.json"),
+        str(deepcode / "deepcode_config.json"),
+    )
+
+
+def public_files_in_sensitive_locations() -> tuple[str, ...]:
+    """Glob patterns for files in :func:`sensitive_locations` that a sandboxed
+    command may still read (never write)."""
+    ssh = Path.home() / ".ssh"
+    return tuple(str(ssh / name) for name in _SSH_PUBLIC_FILES)
+
+
+def _path_values(arguments: Mapping[str, object]):
+    """Strings under path-like keys in ``arguments``, nested ones included."""
+    for name, value in arguments.items():
+        name = str(name)
+        items = value if isinstance(value, (list, tuple)) else [value]
+        for item in items:
+            if isinstance(item, Mapping):
+                yield from _path_values(item)
+            elif isinstance(item, str) and item.strip() and _PATH_KEY.search(name):
+                yield item
+
+
+_SHELL_TOOL_NAMES = ("bash", "exec", "execute_bash", "execute_commands")
+
+
+def _is_shell_tool(tool_name: str) -> bool:
+    return tool_name in _SHELL_TOOL_NAMES or any(
+        tool_name.endswith(f"_{name}") for name in _SHELL_TOOL_NAMES
+    )
+
+
+def is_shell_tool(tool_name: str) -> bool:
+    """Whether ``tool_name`` runs a shell command."""
+
+    return _is_shell_tool(tool_name)
+
+
+# Tools whose only effect is changing files: DeepCode's own, and the names
+# file-editing MCP servers commonly use.
+_FILE_EDIT_TOOL_NAMES = ("write", "edit", "apply_patch")
+_FILE_EDIT_TOOL_SUFFIXES = ("write_file", "edit_file", "create_file")
+
+
+def is_file_edit_tool(tool_name: str) -> bool:
+    """Whether ``tool_name`` changes files and nothing else."""
+
+    return (
+        tool_name in _FILE_EDIT_TOOL_NAMES
+        or tool_name in _FILE_EDIT_TOOL_SUFFIXES
+        or any(tool_name.endswith(f"_{name}") for name in _FILE_EDIT_TOOL_SUFFIXES)
+    )
+
+
+def confirmation_reason(tool_name: str) -> str:
+    """Why a call waits for the user, in words every client can show.
+
+    The approval prompt shows this sentence (the TUI under its heading, the
+    Desktop and Web card as its body) and a denied call reports it to the
+    model, so it names the action, not the engine's internals.
+    """
+
+    if _is_shell_tool(tool_name):
+        return "Running a command needs your approval."
+    if is_file_edit_tool(tool_name):
+        return "Changing files needs your approval."
+    return f"{tool_name} can make changes, so it needs your approval."
+
+
+@dataclass
+class PermissionEngine:
+    """Evaluate tool calls to allow / ask / deny.
+
+    Parameters
+    ----------
+    mode:
+        Governs the implicit decision when no rule matches.
+    rules:
+        Ordered rules; later rules override earlier ones (last-match-wins).
+    read_only_tools:
+        Extra tool names to treat as read-only (merged with the built-ins).
+    cwd:
+        Base directory used to resolve relative paths before denylist checks.
+    approval_policy:
+        Controls whether an ``ask`` decision can be surfaced to an approver.
+    protect_sensitive_paths:
+        Enables the central credential-path boundary.
+    enforce_read_only:
+        Makes mutating-tool denial an upper bound that rules cannot broaden.
+        This is enabled only by the canonical Read only product preset; the
+        default remains false for legacy rule compatibility.
+    bypass_origin_approval:
+        Skips an origin-specific confirmation gate after the shared policy has
+        allowed a call. This is enabled only by the canonical Full Access
+        preset; explicit permission rules still run first and can deny or ask.
+    protect_hook_configs:
+        Makes a write to a hook-discovery file ask. Off only for the canonical
+        Full Access preset: there ``approval_policy`` is ``never``, which would
+        turn the ask into a deny nobody can answer, and Full Access runs
+        commands outside the sandbox anyway — a shell command can write the
+        same file. Everywhere else a hook write keeps asking.
+    risk_evaluator:
+        Optional, strictness-only advisor. When set, it runs *only* on calls
+        the mode default (step 4) would allow and may turn that ``allow`` into
+        ``ask``; it can never loosen a ``deny``, override a rule, or touch the
+        sensitive-path / read-only boundaries. Off by default (``None``); this
+        module never reads the environment — the policy layer
+        (:func:`core.harness.policy.build_permission_engine`) wires in the
+        built-in evaluator when ``DEEPCODE_RISK_EVALUATOR`` is enabled, except
+        under Full Access. A raising / misbehaving evaluator is contained and
+        fails closed to ``ask``.
+    """
+
+    mode: PermissionMode = PermissionMode.DEFAULT
+    rules: list[PermissionRule] = field(default_factory=list)
+    read_only_tools: frozenset[str] = field(default_factory=frozenset)
+    cwd: str | None = None
+    approval_policy: ApprovalPolicy = ApprovalPolicy.ON_REQUEST
+    protect_sensitive_paths: bool = True
+    enforce_read_only: bool = False
+    bypass_origin_approval: bool = False
+    protect_hook_configs: bool = True
+    risk_evaluator: RiskEvaluator | None = None
+
+    def is_read_only(self, tool_name: str) -> bool:
+        known = _READ_ONLY_TOOLS | self.read_only_tools
+        if tool_name in known:
+            return True
+        # ``mcp_<server>_<tool>`` names embed both a server and a tool name,
+        # each of which may contain underscores/dashes, so a single "bare
+        # name" split is ambiguous. Match by suffix instead (the same way the
+        # alias layer resolves bare names): the wrapped name ends with the
+        # known read-only tool name.
+        if tool_name.startswith("mcp_"):
+            return any(tool_name.endswith(f"_{name}") for name in known)
+        return False
+
+    def _candidate_paths(self, arguments: Mapping[str, object]) -> list[str]:
+        paths = list(_path_values(arguments))
+        # apply_patch carries paths in a structured patch envelope rather than
+        # separate JSON fields. Extract only its declarative path directives so
+        # the same central protection applies without a tool-name special case.
+        patch = arguments.get("patch")
+        if isinstance(patch, str):
+            for line in patch.splitlines():
+                for prefix in _PATCH_PATH_PREFIXES:
+                    if line.startswith(prefix):
+                        candidate = line[len(prefix) :].strip()
+                        if candidate:
+                            paths.append(candidate)
+                        break
+        return paths
+
+    def hits_sensitive_path(self, arguments: Mapping[str, object]) -> str | None:
+        """Return the offending raw path if any argument targets a secret."""
+        for raw in self._candidate_paths(arguments):
+            if is_sensitive_path(raw, self.cwd):
+                return raw
+        return None
+
+    def hits_hook_config_path(self, arguments: Mapping[str, object]) -> str | None:
+        """Return the raw path if any argument targets a hook-discovery file."""
+        for raw in self._candidate_paths(arguments):
+            if is_hook_config_path(raw, self.cwd):
+                return raw
+        return None
+
+    @staticmethod
+    def _argument_string(tool_name: str, arguments: Mapping[str, object]) -> str:
+        """Best-effort string a pattern rule matches against.
+
+        For shell tools it is the command; otherwise the first path-like arg,
+        falling back to the whole argument repr so ``*`` rules still work.
+        """
+        if _is_shell_tool(tool_name):
+            for key in ("command", "cmd", "commands", "script"):
+                value = arguments.get(key)
+                if isinstance(value, str):
+                    return value
+                if isinstance(value, (list, tuple)):
+                    return " ".join(str(v) for v in value)
+        for key in _PATH_ARG_KEYS:
+            value = arguments.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        return " ".join(f"{k}={v}" for k, v in sorted(arguments.items()))
+
+    def evaluate(
+        self, tool_name: str, arguments: Mapping[str, object] | None = None
+    ) -> tuple[PermissionDecision, str]:
+        return self._evaluate(tool_name, arguments, read_only_override=None)
+
+    def evaluate_tool(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, object] | None = None,
+        *,
+        read_only: bool | None = None,
+        approval_mode: str | None = None,
+    ) -> tuple[PermissionDecision, str]:
+        """Evaluate a concrete Tool and then apply an origin-specific gate.
+
+        MCP approval modes are restrictions only: they may turn a global
+        ``allow`` into ``ask``, but can never widen a global ``ask`` or
+        ``deny``. Tool metadata therefore composes with the product security
+        profile instead of creating a second permission engine.
+        """
+
+        decision, reason = self._evaluate(
+            tool_name,
+            arguments,
+            read_only_override=read_only,
+        )
+        if decision is not PermissionDecision.ALLOW or approval_mode is None:
+            return decision, reason
+        if self.bypass_origin_approval:
+            return decision, reason
+        mode = str(getattr(approval_mode, "value", approval_mode)).casefold()
+        if mode in {"auto", "approve"}:
+            return decision, reason
+        if mode == "prompt":
+            return self._apply_approval_policy(
+                PermissionDecision.ASK,
+                "MCP tool policy requires confirmation",
+            )
+        if mode == "writes":
+            if read_only is True:
+                return decision, reason
+            return self._apply_approval_policy(
+                PermissionDecision.ASK,
+                "MCP tool is not declared read-only and requires confirmation",
+            )
+        return PermissionDecision.DENY, "unknown MCP approval policy (fail-closed)"
+
+    def _evaluate(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, object] | None,
+        *,
+        read_only_override: bool | None,
+    ) -> tuple[PermissionDecision, str]:
+        """Return ``(decision, reason)`` for a tool call.
+
+        ``reason`` is a short human/model-readable string; when a call is
+        denied the kernel surfaces it back to the model as the tool result
+        (errors-as-data), so it must explain *why* and hint a legal path.
+        """
+        arguments = arguments or {}
+
+        offending = (
+            self.hits_sensitive_path(arguments)
+            if self.protect_sensitive_paths
+            else None
+        )
+        if offending is not None:
+            return (
+                PermissionDecision.DENY,
+                (
+                    f"Access to '{offending}' is blocked: it matches the "
+                    "non-overridable sensitive-path denylist (credentials / "
+                    "secrets). Permission rules cannot override this boundary."
+                ),
+            )
+
+        read_only = (
+            self.is_read_only(tool_name)
+            if read_only_override is None
+            else read_only_override
+        )
+        if self.enforce_read_only and not read_only:
+            return (
+                PermissionDecision.DENY,
+                "read-only access preset: mutating tools cannot be enabled by rules",
+            )
+
+        # A write to a file hooks are discovered from installs handlers that
+        # run commands in a later session. Downgrade every write that would
+        # otherwise be allowed to a confirmation: reads are never gated here,
+        # and a decision that is already stricter (deny rule, plan mode, the
+        # read-only preset above) keeps its strength — an ask only meets allow.
+        # ``protect_hook_configs`` is off only under Full Access (see the
+        # dataclass field), where the ask would become an unanswerable deny.
+        hook_config = (
+            None
+            if read_only or not self.protect_hook_configs
+            else self.hits_hook_config_path(arguments)
+        )
+
+        argument = self._argument_string(tool_name, arguments)
+        matched: PermissionRule | None = None
+        for rule in self.rules:  # last match wins
+            if rule.matches(tool_name, argument):
+                matched = rule
+        if matched is not None:
+            if matched.action is PermissionDecision.ALLOW and hook_config is not None:
+                return self._apply_approval_policy(
+                    PermissionDecision.ASK,
+                    (
+                        f"Writing '{hook_config}' requires confirmation: hook "
+                        "handlers run commands in a later session"
+                    ),
+                )
+            rule = f"{matched.permission} {matched.pattern}"
+            if matched.action is PermissionDecision.ASK:
+                reason = f"Your permission rule `{rule}` asks before this runs."
+            elif matched.action is PermissionDecision.DENY:
+                reason = f"Blocked by your permission rule `{rule}`."
+            else:
+                reason = f"Allowed by your permission rule `{rule}`."
+            return self._apply_approval_policy(matched.action, reason)
+
+        if self.mode is PermissionMode.PLAN:
+            if read_only:
+                return self._mode_default_allow(
+                    tool_name,
+                    arguments,
+                    "plan mode: read-only tool allowed",
+                )
+            return (
+                PermissionDecision.DENY,
+                "plan mode: mutating tools are denied; only read-only "
+                "exploration is permitted until the plan is approved.",
+            )
+        if self.mode is PermissionMode.FULL_AUTO:
+            if hook_config is not None:
+                return self._apply_approval_policy(
+                    PermissionDecision.ASK,
+                    (
+                        f"Writing '{hook_config}' requires confirmation: hook "
+                        "handlers run commands in a later session"
+                    ),
+                )
+            return self._mode_default_allow(
+                tool_name, arguments, "full_auto mode: no implicit gate"
+            )
+        # DEFAULT
+        if read_only:
+            return self._mode_default_allow(
+                tool_name, arguments, "default mode: read-only tool allowed"
+            )
+        return self._apply_approval_policy(
+            PermissionDecision.ASK,
+            confirmation_reason(tool_name),
+        )
+
+    def _mode_default_allow(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, object],
+        reason: str,
+    ) -> tuple[PermissionDecision, str]:
+        """Return the mode-default ``allow``, after an optional risk second look.
+
+        This is the single place the strictness-only risk evaluator plugs in:
+        a call that the mode default (step 4) would allow is offered to the
+        evaluator, which may raise it to ``ask`` (and thence to ``deny`` under a
+        ``never`` approval policy, via :meth:`_apply_approval_policy`). The
+        sensitive-path denylist, the read-only upper bound, and explicit rules
+        have all already decided above, so the evaluator can only ever make the
+        engine *more* careful — never less.
+
+        With no evaluator wired in, this returns the plain ``allow`` unchanged,
+        so every decision and reason is identical to the engine without the
+        feature.
+        """
+
+        if self.risk_evaluator is None:
+            return PermissionDecision.ALLOW, reason
+
+        risk_reason = self._risk_opinion(tool_name, arguments)
+        if risk_reason is None:
+            return PermissionDecision.ALLOW, reason
+        return self._apply_approval_policy(
+            PermissionDecision.ASK,
+            f"risk evaluator flagged this call: {risk_reason}",
+        )
+
+    def _risk_opinion(
+        self, tool_name: str, arguments: Mapping[str, object]
+    ) -> str | None:
+        """Ask the evaluator for an opinion on this exact call.
+
+        Not cached: the rules-only evaluator is cheap, and a cache keyed on
+        anything other than the exact input the evaluator inspects could hand
+        one call another call's verdict.
+
+        Failures are contained and fail closed: an evaluator that raises, or
+        returns anything other than ``None`` or a non-empty string, yields an
+        ``ask`` reason rather than crashing the permission path or silently
+        allowing. The operator opted in to a second look, so a broken advisor
+        must not quietly waive it.
+        """
+
+        if self.risk_evaluator is None:
+            return None
+        try:
+            opinion = self.risk_evaluator(tool_name, arguments)
+        except Exception:  # noqa: BLE001 - advisory evaluator must never crash the gate
+            return "evaluator error (fail-closed)"
+        if opinion is not None and not (isinstance(opinion, str) and opinion.strip()):
+            return "evaluator returned an unusable opinion (fail-closed)"
+        return opinion
+
+    def _apply_approval_policy(
+        self,
+        decision: PermissionDecision,
+        reason: str,
+    ) -> tuple[PermissionDecision, str]:
+        """Make ``never`` fail closed instead of silently auto-approving ASK.
+
+        Full Access uses ``FULL_AUTO`` so ordinary calls do not ask.  An
+        explicit user rule may still resolve to ASK, however, and a headless or
+        otherwise non-interactive profile must not turn that into permission.
+        """
+
+        if (
+            decision is PermissionDecision.ASK
+            and self.approval_policy is ApprovalPolicy.NEVER
+        ):
+            return (
+                PermissionDecision.DENY,
+                f"{reason}; approval policy is never, so the request is denied",
+            )
+        return decision, reason
+
+
+def rules_from_config(
+    config: Mapping[str, object] | None,
+) -> list[PermissionRule]:
+    """Build an ordered ruleset from a nested ``{perm: {pattern: action}}`` map.
+
+    Also accepts the shorthand ``{perm: "allow"}`` (pattern ``*``). Unknown
+    action strings raise ``ValueError`` so typos fail loudly.
+    """
+    return rules_from_snapshots(normalize_permission_rules(config))
+
+
+def rules_from_snapshots(
+    rules: Iterable[ExecutionPermissionRuleSnapshot],
+) -> list[PermissionRule]:
+    """Adapt immutable domain snapshots to the harness evaluator type."""
+
+    return [
+        PermissionRule(
+            permission=rule.permission,
+            pattern=rule.pattern,
+            action=PermissionDecision(rule.action.value),
+        )
+        for rule in rules
+    ]
+
+
+def make_engine(
+    mode: str | PermissionMode = PermissionMode.DEFAULT,
+    *,
+    rules_config: Mapping[str, object] | None = None,
+    extra_read_only: Iterable[str] | None = None,
+    cwd: str | None = None,
+    approval_policy: ApprovalPolicy = ApprovalPolicy.ON_REQUEST,
+    protect_sensitive_paths: bool = True,
+    enforce_read_only: bool = False,
+    risk_evaluator: RiskEvaluator | None = None,
+) -> PermissionEngine:
+    """Convenience constructor from loosely-typed inputs (config/CLI).
+
+    ``risk_evaluator`` is used only when passed explicitly; the environment is
+    never consulted here.
+    """
+    resolved_mode = mode if isinstance(mode, PermissionMode) else PermissionMode(mode)
+    return PermissionEngine(
+        mode=resolved_mode,
+        rules=rules_from_config(rules_config),
+        read_only_tools=frozenset(extra_read_only or ()),
+        cwd=cwd,
+        approval_policy=approval_policy,
+        protect_sensitive_paths=protect_sensitive_paths,
+        enforce_read_only=enforce_read_only,
+        risk_evaluator=risk_evaluator,
+    )
